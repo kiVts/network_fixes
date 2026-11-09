@@ -533,7 +533,7 @@ uint64_t g_h_claims = 0, g_h_steer = 0, g_h_denied = 0, g_h_done = 0, g_h_batche
 double g_h_max_err = 0, g_c_max_moved = 0;
 int g_claim_logs = 0, g_host_claim_logs = 0, g_joint_logs = 0;
 DWORD g_update_thread = 0; // the pre-step's thread (the kinematic detour only acts there)
-// touch census (client, update thread): physics_fixes' swml_touched_bodies, what it returned in this 30 s window
+// touch census (client, update thread): swml_touched_bodies (touch_census.cpp), what it returned in this 30 s window
 using Touched_t = int(__cdecl*)(const void** out, int max);
 Touched_t g_touched = nullptr;
 DWORD g_touched_looked = 0, g_census_at = 0;
@@ -843,15 +843,15 @@ void census_touched(const RingView& objects, const RingView& vehicles, DWORD now
     if (!g_touched) {
         if (g_touched_looked && now - g_touched_looked < 5000) return;
         g_touched_looked = now;
-        HMODULE m = GetModuleHandleW(L"physics_fixes.dll");
+        HMODULE m = GetModuleHandleW(L"network_fixes.dll"); // touch_census.cpp
         g_touched = m ? reinterpret_cast<Touched_t>(GetProcAddress(m, "swml_touched_bodies")) : nullptr;
         static bool told = false;
         if (!g_touched) {
-            if (!told) swlog("object push: no touch census (needs physics_fixes 0.25.3 or later): bodies outside the lists aren't logged");
+            if (!told) swlog("object push: no touch census: bodies outside the lists aren't logged");
             told = true;
             return;
         }
-        swlog("object push: physics_fixes' touch census found");
+        swlog("object push: touch census found");
     }
     const void* list[32];
     int n = g_touched(list, 32);

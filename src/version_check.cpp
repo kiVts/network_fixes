@@ -34,8 +34,8 @@ struct SimSetting {
 };
 // Settings that change what the simulation computes (not just how fast or what is logged).
 constexpr SimSetting kSimSettings[] = {
-    {"physics_fixes", L"wheels", L"spin_fix", L"1"},
-    {"physics_fixes", L"wheels", L"keep_per_tick", L"0.9999"},
+    {"realistic_aero", L"wheels", L"spin_fix", L"1"},
+    {"realistic_aero", L"wheels", L"keep_per_tick", L"0.9999"},
     {"realistic_aero", L"fix", L"enabled", L"1"},
     {"realistic_aero", L"vlm", L"mode", L"off"},
     {"network_fixes", L"push", L"remote_push", L"1"},
