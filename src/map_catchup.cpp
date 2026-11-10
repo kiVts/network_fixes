@@ -3,6 +3,10 @@
 #include "hooks.h"
 #include "log.h"
 #include "editor_background.h"
+#include "host_map_scheduler.h"
+#include "host_map_bridge.h"
+
+double host_map_pacing_period_ms();
 
 #include <windows.h>
 #include <intrin.h>
@@ -30,6 +34,13 @@ uintptr_t g_main_lo = 0, g_main_hi = 0;
 const volatile uint8_t* g_is_host = nullptr;
 int g_budget_ms = 100;
 int g_editor_ticks = 1;
+int g_host_map_budget_ms = host_map::default_budget_ms;
+bool g_host_map_ready = false;
+thread_local host_map::Scheduler g_host_map_schedule;
+thread_local U g_host_map_game = 0;
+thread_local uint32_t g_host_map_step = 16;
+std::atomic<uint64_t> g_host_map_epoch{1};
+thread_local uint64_t g_host_map_epoch_seen = 0;
 LARGE_INTEGER g_freq{};
 
 volatile LONG* g_editor_tid = nullptr;
@@ -111,6 +122,12 @@ bool editor_front(U game)
     return front && sim && front != sim;
 }
 
+bool simulation_front(U game)
+{
+    auto front = *reinterpret_cast<const uintptr_t*>(game + kFrontState);
+    return front && front == *reinterpret_cast<const uintptr_t*>(game + kSimulation);
+}
+
 std::atomic<bool> g_inline{false}; // written by the main thread, cleared by the update thread when it takes over
 // Main thread only.
 DWORD g_inline_since = 0, g_win_start = 0;
@@ -146,6 +163,57 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
     uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
     bool client = !*g_is_host;
     bool main = ret >= g_main_lo && ret < g_main_hi;
+    if (!main) g_host_map_epoch.fetch_add(1, std::memory_order_relaxed);
+    // Native main-loop ownership has already stopped/joined the update worker.
+    // All ticks finish before returning to map drawing; never move them onto a
+    // concurrent worker. Foreground editors retain their separate policy.
+    if (!client && main && simulation_front(game) && g_host_map_ready) {
+        const auto simulation = *reinterpret_cast<const uintptr_t*>(game + kSimulation);
+        const auto epoch = g_host_map_epoch.load(std::memory_order_relaxed);
+        bool entering = g_host_map_game != game || g_host_map_epoch_seen != epoch;
+        if (entering) {
+            g_host_map_schedule.reset(); g_host_map_game = game;
+            g_host_map_epoch_seen = epoch; g_host_map_step = 16;
+        }
+        LARGE_INTEGER start; QueryPerformanceCounter(&start);
+        const double now = double(start.QuadPart) * 1000.0 / double(g_freq.QuadPart);
+        g_host_map_schedule.frame(now, std::max(double(g_host_map_step), host_map_pacing_period_ms()));
+        double last_ms = 0;
+        int ticks = 0;
+        for (int i = 0; i < host_map::Scheduler::max_ticks; ++i) {
+            if (i && (!g_host_map_schedule.due() || ms_since(start.QuadPart) + last_ms > g_host_map_budget_ms)) break;
+            host_map::Call call{uintptr_t(game), g_host_map_schedule.due()};
+            auto* previous = host_map::active;
+            host_map::active = &call;
+            LARGE_INTEGER before; QueryPerformanceCounter(&before);
+            __try { g_orig(game, a2, a3, a4); }
+            __finally { host_map::active = previous; }
+            last_ms = ms_since(before.QuadPart);
+            if (!call.reached) break; // a transition bypassed the host branch
+            g_host_map_step = call.step;
+            if (call.allow) { g_host_map_schedule.consumed(); ++ticks; }
+            if (!*g_is_host || !simulation_front(game) ||
+                simulation != *reinterpret_cast<const uintptr_t*>(game + kSimulation)) {
+                g_host_map_schedule.reset(); g_host_map_game = 0;
+                break; // a tick requested a role/world/foreground transition
+            }
+        }
+        static thread_local double log_at = 0;
+        static thread_local uint64_t frames = 0, total_ticks = 0;
+        static thread_local double worst_ms = 0;
+        if (entering) { log_at = now; frames = total_ticks = 0; worst_ms = 0; }
+        ++frames; total_ticks += ticks;
+        worst_ms = std::max(worst_ms, ms_since(start.QuadPart));
+        if (!log_at) log_at = now;
+        if (now - log_at >= 10000) {
+            swlog("host map 10s: %.1f frames/s, %.1f ticks/s, worst frame simulation %.1f ms; budget %d ms, batch cap %d",
+                frames * 1000.0 / (now - log_at), total_ticks * 1000.0 / (now - log_at), worst_ms,
+                g_host_map_budget_ms, host_map::Scheduler::max_ticks);
+            log_at = now; frames = total_ticks = 0; worst_ms = 0;
+        }
+        return;
+    }
+    g_host_map_schedule.reset(); g_host_map_game = 0;
     if (client && main && editor_background_frame(game, a2, a3)) {
         g_inline.store(false, std::memory_order_relaxed); // world replay belongs to the worker, so pacing can report
         return;
@@ -203,6 +271,7 @@ bool install()
 {
     g_budget_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"map_catchup_ms", 100, settings_ini())), 0, 1000);
     g_editor_ticks = std::clamp(int(GetPrivateProfileIntW(L"net", L"editor_catchup_ticks", 1, settings_ini())), 0, 10);
+    g_host_map_budget_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"host_map_budget_ms", host_map::default_budget_ms, settings_ini())), 0, 50);
     QueryPerformanceFrequency(&g_freq);
     g_main_lo = reinterpret_cast<uintptr_t>(game_ptr<void*>(kMainLoop));
     g_main_hi = g_main_lo + per_build<uintptr_t>(kMainLoopSize, 2984); // build 0x6ae218ec: the loop grew 48 bytes
@@ -210,6 +279,10 @@ bool install()
     if (!g_is_host || !g_main_lo) return false;
     bool limited = !g_editor_ticks;
     bool ok = hook_game(kTick, reinterpret_cast<void*>(&tick_detour), reinterpret_cast<void**>(&g_orig));
+    if (ok && g_host_map_budget_ms) {
+        g_host_map_ready = host_map::install(game_ptr<uint8_t*>(kTick), 1776);
+        swlog("host map: %s; same-thread tick budget %d ms, at most %d ticks/frame", g_host_map_ready ? "on" : "FAILED native contract", g_host_map_budget_ms, host_map::Scheduler::max_ticks);
+    }
     if (ok && g_editor_ticks) {
         limited = install_editor_limit(game_ptr<uint8_t*>(kCatchUp), 1728, g_editor_ticks);
         swlog("editor catch-up: %s (client foreground screen: at most %d host ticks/frame, no extra calls; world updates retained)",
@@ -217,7 +290,7 @@ bool install()
     }
     swlog("map catch-up: %s", !ok ? "FAILED" : g_budget_ms ? "on (client, map open and behind: up to the frame budget)" : "off, map open/close logged only");
     if (ok && g_budget_ms) swlog("map catch-up: frame budget %d ms", g_budget_ms);
-    return ok && limited;
+    return ok && limited && (!g_host_map_budget_ms || g_host_map_ready);
 }
 
 HookRegistrar reg{{"map open catch-up", /*needs_known_build=*/true, &install}};

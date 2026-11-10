@@ -201,3 +201,13 @@ bool install()
 HookRegistrar reg{{"host pacing", false, &install}};
 
 } // namespace
+
+// Called only while the native main loop owns simulation and the update worker
+// is stopped. Refresh backlog feedback there too; on_idle is not running then.
+double host_map_pacing_period_ms()
+{
+    if (!g_on) return kGameTickMs;
+    DWORD now = GetTickCount();
+    if (now - g_last_step >= kStepMs) { g_last_step = now; step(now); }
+    return g_period;
+}

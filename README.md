@@ -1,5 +1,7 @@
 # Stormworks Network Fixes
 
+The host fullscreen map now supports bounded simulation batches on the drawing thread, helping the world keep pace when the map renders below the simulation rate. The default host_map_budget_ms=32 limits extra work, with at most four ticks per frame; 0 restores vanilla behavior. Host pacing still applies. An overloaded world or an expensive native tick can still slow or stall simulation. Automated checks pass; live map/world validation remains pending.
+
 The stability update verifies exact delivered copies before suppressing reliable updates, bounds receive work and copy queues, synchronizes network startup with shutdown, and hardens editor catch-up handling. Detected mismatches are reported through SWML. Already-applied incorrect copies cannot be rolled back, and a single expensive world tick can still delay an editor frame. Regression tests pass; live multiplayer soak testing remains pending.
 Smoother multiplayer for players with high ping, fast mod downloads when joining, and no long slowdown while a big vehicle spawns.
 
