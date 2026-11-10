@@ -17,7 +17,7 @@ The host needs this mod for most of it. Players without it can still join. Featu
 
 Client pushing of objects and small vehicles needs [Physics Fixes](https://github.com/kiVts/physics_fixes) as well, on both PCs.
 
-This will likely trigger your antivirus, but there are no viruses in here. If a game crashes, feel free to make an issue here.
+This will likely trigger your antivirus, but there are no viruses in here. If a game crashes feel free to make an issue here and [join the discord](https://discord.gg/SsT4Y6Y3Zm) so the process to fixing them is quicker.
 
 **THIS IS A  WIP MOD. IT IS UNSTABLE.**
 
