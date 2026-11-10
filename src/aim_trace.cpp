@@ -66,6 +66,20 @@ bool collect(uintptr_t simulation, uintptr_t player, bool host, Record* out, uin
         if (!world) return false;
         Ring vehicles;
         if (!ring(world+g_vehicle_ring,vehicles,16384)) return false;
+        // The native host correction sender uses these exact per-peer positions
+        // when choosing distance-dependent update intervals. Keep the host/local
+        // flag so a proximity report can be checked against every observer.
+        if(host) {
+            Ring peers;
+            if(!ring(player+0x1c0,peers,64))return false;
+            for(uint32_t i=0;i<peers.count;++i) {
+                if(n==kBatch) {cut=true;return true;}
+                uintptr_t p=at(peers,i);if(!p)continue;
+                Record& r=out[n++];r={};r.tick=tick;r.host=1;r.camera=2;
+                r.body=rd<uint16_t>(p+0x80);r.target_valid=rd<uint8_t>(p+0xa0)!=0;
+                memcpy(r.pose+12,reinterpret_cast<void*>(p+0x40),24);
+            }
+        }
         uint32_t scanned=0;
         for (uint32_t vi=0;vi<vehicles.count;++vi) {
             if (++scanned>20000) { cut=true; return true; }
@@ -134,6 +148,11 @@ void writer()
         while (r!=w) {
             const Record x=g_records[r%kSlots];
             g_read.store(++r,std::memory_order_release);
+            if(x.camera==2) {
+                swlog("aim peer: {\"tick\":%u,\"peer\":%u,\"local\":%u,\"position\":[%.9g,%.9g,%.9g]}",
+                      x.tick,x.body,x.target_valid,x.pose[12],x.pose[13],x.pose[14]);
+                continue;
+            }
             char pose[640]={}, target[640]={};
             matrix(pose,sizeof pose,x.pose); matrix(target,sizeof target,x.target);
             swlog("aim trace: {\"tick\":%u,\"role\":\"%s\",\"vehicle\":%u,\"body\":%u,\"kind\":\"%s\","

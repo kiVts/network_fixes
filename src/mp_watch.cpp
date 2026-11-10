@@ -4,6 +4,7 @@
 #include "log.h"
 #include "net_shared.h"
 #include "aim_trace.h"
+#include "logic_trace.h"
 #include "sdk.h"
 
 #include <windows.h>
@@ -35,6 +36,7 @@ F12 o_simulate = nullptr;
 
 const volatile uint8_t* g_is_host = nullptr;
 double g_stall_ms = 250;
+bool g_event_details=false;
 LARGE_INTEGER g_freq{};
 
 double now_ms()
@@ -282,11 +284,37 @@ void __fastcall catchup_detour(U g, U a2, U a3, U a4, U a5)
     flush(false);
 }
 
+bool event_snapshot(uintptr_t ring,uint32_t* counts,uint32_t& total)
+{
+    __try {
+        auto data=*reinterpret_cast<const uintptr_t* const*>(ring);
+        uint32_t cap=*reinterpret_cast<const uint32_t*>(ring+8),first=*reinterpret_cast<const uint32_t*>(ring+12);
+        total=*reinterpret_cast<const uint32_t*>(ring+16);
+        if(total>100000 || total>cap || (total && (!data || !cap || first>=cap)))return false;
+        for(uint32_t i=0;i<total;++i) {
+            uintptr_t event=data[(uint64_t(first)+i)%cap];
+            if(event) {uint32_t type=*reinterpret_cast<const uint32_t*>(event+8);if(type<0xc4)counts[type]++;}
+        }
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
+}
+
 void __fastcall apply_detour(U a1, U a2, U a3, U a4, U a5, U a6)
 {
+    uint32_t counts[0xc4]{},event_count=0;
+    const bool details=g_event_details && a5 && event_snapshot(a5,counts,event_count);
     double t0 = now_ms();
     o_apply(a1, a2, a3, a4, a5, a6);
     double ms = now_ms() - t0;
+    if(details && ms>g_stall_ms) {
+        std::string events;
+        for(uint32_t i=0;i<0xc4;++i)if(counts[i]) {
+            char entry[32];snprintf(entry,sizeof entry," 0x%x=%u",i,counts[i]);
+            if(events.size()+strlen(entry)>1200)break;
+            events+=entry;
+        }
+        swlog("mp slow apply: %.0f ms, %u native events; type counts:%s (counts identify the batch, not per-event timings)",ms,event_count,events.c_str());
+    }
     tl_apply += ms;
     if (*g_is_host) return; // the host applies its own tick's events inside its tick; counted there
     std::lock_guard lock(g_mu);
@@ -295,10 +323,12 @@ void __fastcall apply_detour(U a1, U a2, U a3, U a4, U a5, U a6)
 
 void __fastcall simulate_detour(U a1, U a2, U a3, U a4, U a5, U a6, U a7, U a8, U a9, U a10, U a11, U a12)
 {
+    logic_trace_begin(a1,a3,*g_is_host!=0);
     double t0 = now_ms();
     o_simulate(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
     double ms = now_ms() - t0;
     tl_sim += ms;
+    logic_trace_end();
     aim_trace_sample(a1, a3, *g_is_host != 0);
     std::lock_guard lock(g_mu);
     g_simulate.add(ms);
@@ -348,7 +378,9 @@ bool install()
 {
     const wchar_t* ini = settings_ini();
     const bool aim_trace = aim_trace_install();
-    if (!GetPrivateProfileIntW(L"mp", L"log", 1, ini) && !aim_trace) {
+    const bool logic_trace = logic_trace_install();
+    g_event_details=aim_trace || logic_trace || GetPrivateProfileIntW(L"mp",L"event_details",0,ini)!=0;
+    if (!GetPrivateProfileIntW(L"mp", L"log", 1, ini) && !aim_trace && !logic_trace) {
         swlog("mp watch: off in settings.ini");
         return true;
     }
