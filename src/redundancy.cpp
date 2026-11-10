@@ -79,8 +79,8 @@ uint32_t hash_bytes(const void* p, uint32_t n)
 }
 
 struct Key {
-    uint8_t b[16]; // identity type, size, SteamID
-    bool operator<(const Key& o) const { return memcmp(b, o.b, 16) < 0; }
+    uint8_t b[32]; // identity type, size, SteamID or IPv6 + port
+    bool operator<(const Key& o) const { return memcmp(b, o.b, sizeof(b)) < 0; }
 };
 
 struct Copy {
@@ -187,11 +187,12 @@ void sdk_poll(void* self, Send_t send) {
         uint32_t epoch = 0;
         {
             std::lock_guard lock(g_peers_mu);
-            Key key; memcpy(key.b, packet.peer.identity, 16);
-            auto it = g_peers.find(key);
-            if (it != g_peers.end() && it->second->sdk_registered &&
-                it->second->sdk_peer.generation == packet.peer.generation) {
-                memcpy(identity, it->second->identity, sizeof(identity)); epoch = it->second->epoch;
+            for (auto& [key, p] : g_peers) {
+                if (p->sdk_registered && p->sdk_peer.generation == packet.peer.generation &&
+                    !memcmp(p->sdk_peer.identity, packet.peer.identity, sizeof(packet.peer.identity))) {
+                    memcpy(identity, p->identity, sizeof(identity)); epoch = p->epoch;
+                    break;
+                }
             }
         }
         g_sdk_completion = SWML_UNAVAILABLE;
@@ -210,8 +211,8 @@ void sdk_poll(void* self, Send_t send) {
 
 Peer& peer_for(const void* identity)
 {
-    Key k;
-    memcpy(k.b, identity, 16);
+    Key k{};
+    memcpy(k.b, identity, sizeof(k.b));
     std::lock_guard lock(g_peers_mu);
     auto it = g_peers.find(k);
     if (it != g_peers.end()) return *it->second;
@@ -315,6 +316,9 @@ void reset_receive(Peer& p, uint32_t epoch)
 // client stuck on the Spawning screen) and never noticed it leave. The map is also capped now.
 bool vote(Peer& p, int64_t offset)
 {
+    while (!p.delivered.empty() && p.delivered.begin()->first < p.r) {
+        p.delivered.erase(p.delivered.begin());
+    }
     if (!p.delivered.empty()) return false; // settle the previous epoch's twins before adopting another offset
     if (p.votes.size() >= kMaxVoteOffsets && !p.votes.count(offset)) p.votes.clear(); // no consensus: start over
     int mine = ++p.votes[offset];
@@ -617,6 +621,9 @@ void on_reliable(void* msg)
     uint32_t size = static_cast<uint32_t>(*reinterpret_cast<int*>(mb + kMsgSize));
     uint32_t h = hash_bytes(data, size);
     uint64_t r = p.r++;
+    while (!p.delivered.empty() && p.delivered.begin()->first < r) {
+        p.delivered.erase(p.delivered.begin());
+    }
     if (auto delivered = p.delivered.find(r); delivered != p.delivered.end()) {
         const bool same = delivered->second.size() == size &&
             (size == 0 || !memcmp(delivered->second.data(), data, size));
@@ -789,9 +796,9 @@ void send_backlog(void* self, Send_t send)
     if (now - g_last_backlog_report < kBacklogEveryMs) return;
     int depth;
     if (!playout_client_depth(depth)) return;
-    // Map or editor open: the game simulates on the render thread at frame rate and falls behind by design; the host
-    // slowing the world for everyone wouldn't help. No report: the host's pacing ages it out and eases back.
-    if (map_inline_active()) return;
+    // If inline on render thread (map/editor), continue reporting backlog once depth exceeds the playout threshold (14)
+    // so the host pacing does not accelerate to 62.5 ticks/s and create an unbounded runaway queue.
+    if (map_inline_active() && depth <= 14) return;
     g_last_backlog_report = now;
     uint8_t buf[sizeof(Header) + sizeof(uint32_t)];
     std::lock_guard lock(g_peers_mu);
@@ -862,8 +869,8 @@ int dup_receive_ch0(void* self, void** out, int max, Receive_t recv)
 
 bool dup_peer_reporting(const void* identity, DWORD max_age_ms)
 {
-    Key k;
-    memcpy(k.b, identity, 16);
+    Key k{};
+    memcpy(k.b, identity, sizeof(k.b));
     std::lock_guard lock(g_peers_mu);
     auto it = g_peers.find(k);
     if (it == g_peers.end()) return false;

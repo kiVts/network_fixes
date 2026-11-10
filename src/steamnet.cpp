@@ -92,7 +92,7 @@ GetSessionInfo_t g_get_info = nullptr;
 SetGlobalInt32_t g_set_int = nullptr;
 
 // --- peers ----------------------------------------------------------------------------
-// SteamNetworkingIdentity is 136 bytes; compared on type + size + SteamID (first 16 bytes), never logged.
+// SteamNetworkingIdentity is 136 bytes; compared on type + size + SteamID or IPv6/port (first 32 bytes), never logged.
 constexpr size_t kIdentitySize = 136;
 constexpr int kMaxPeers = 16;
 constexpr int kTicksPerWindow = 5; // 200 ms ticks -> 1 s measurement windows
@@ -138,7 +138,7 @@ Peer* find_peer_locked(const void* identity)
 {
     Peer* slot = nullptr;
     for (Peer& p : g_peers) {
-        if (p.used && memcmp(p.id, identity, 16) == 0) return &p;
+        if (p.used && memcmp(p.id, identity, 32) == 0) return &p;
         if (!p.used && !slot) slot = &p;
     }
     if (!slot) {

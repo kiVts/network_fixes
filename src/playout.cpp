@@ -41,8 +41,8 @@ size_t g_arr_next = 0;
 uint64_t g_arr_total = 0;
 
 // --- update thread only ------------------------------------------------------------------
-uint8_t* g_game = nullptr;
-bool g_in_catchup = false;
+thread_local uint8_t* g_game = nullptr;
+thread_local bool g_in_catchup = false;
 LARGE_INTEGER g_freq{};
 LONGLONG g_prev_qpc = 0;
 double g_credit = 0;     // ticks owed to the playback
@@ -159,6 +159,7 @@ void log_window(LONGLONG now)
 
 void decide()
 {
+    if (!g_game) return;
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     LONGLONG now = q.QuadPart;
@@ -234,6 +235,7 @@ void __fastcall catchup_detour(U g, U p2, U p3, U p4, U p5)
     g_in_catchup = true;
     g_orig_catchup(g, p2, p3, p4, p5);
     g_in_catchup = false;
+    g_game = nullptr;
 }
 
 // Client message send: last call before the catch-up formula reads the clock.

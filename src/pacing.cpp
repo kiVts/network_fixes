@@ -39,7 +39,8 @@ bool g_waited = false; // this iteration's wait already ran inside the frame
 bool g_on = false;
 const volatile uint8_t* g_is_host = nullptr;
 int g_target = 2;
-double g_max_ms = 25;
+double g_max_ms = 33;
+double g_catchup_max_ms = 40;
 int g_queue_limit_ms = 250; // pacing_queue_ms
 LARGE_INTEGER g_freq{};
 
@@ -77,7 +78,12 @@ void step(DWORD now)
     if (peers == 0 || behind < 0) {
         g_period = std::max(kGameTickMs, g_period - 0.1); // nobody reporting: back to the game's pace
     } else if (behind > g_target) {
-        g_period = std::min(g_max_ms, g_period + std::min(0.5, 0.04 + 0.002 * (behind - g_target)));
+        double ceiling = (behind > 60) ? g_catchup_max_ms : g_max_ms;
+        if (g_period > ceiling) {
+            g_period = std::max(ceiling, g_period - 0.1);
+        } else {
+            g_period = std::min(ceiling, g_period + std::min(0.5, 0.04 + 0.002 * (behind - g_target)));
+        }
     } else if (behind <= g_target / 2) {
         g_period = std::max(kGameTickMs, g_period - 0.05);
     }
@@ -166,7 +172,8 @@ bool install()
     const wchar_t* ini = settings_ini();
     g_on = GetPrivateProfileIntW(L"net", L"host_pacing", 0, ini) != 0; // off by default: a last resort
     g_target = std::clamp(int(GetPrivateProfileIntW(L"net", L"pacing_target_ticks", 2, ini)), 2, 200);
-    g_max_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"max_tick_ms", 25, ini)), 17, 50);
+    g_max_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"max_tick_ms", 33, ini)), 17, 50);
+    g_catchup_max_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"catchup_max_tick_ms", 40, ini)), int(g_max_ms), 50);
     g_queue_limit_ms = std::max(50, int(GetPrivateProfileIntW(L"net", L"pacing_queue_ms", 250, ini)));
     if (!g_on) {
         swlog("host pacing: off in settings.ini");
@@ -186,8 +193,8 @@ bool install()
     else if (!hook_game(kFrameEnd, reinterpret_cast<void*>(&frame_end_detour), reinterpret_cast<void**>(&g_orig_frame_end)))
         swlog("host pacing: profiler frame hook failed; the wait shows as idle in the F1 profiler");
     swlog("host pacing: on (when hosting, slows to the slowest modded client: keep it within %d ticks, or a playing "
-          "player's send queue under %d ms; at most %d ms per tick = %.0f ticks/s)",
-          g_target, g_queue_limit_ms, int(g_max_ms), 1000.0 / g_max_ms);
+          "player's send queue under %d ms; at most %d ms per tick = %.0f ticks/s, catchup ceiling %d ms = %.0f ticks/s)",
+          g_target, g_queue_limit_ms, int(g_max_ms), 1000.0 / g_max_ms, int(g_catchup_max_ms), 1000.0 / g_catchup_max_ms);
     return true;
 }
 
