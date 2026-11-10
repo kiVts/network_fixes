@@ -38,6 +38,7 @@ swml_add_mod(network_fixes SOURCES
   src/object_push.cpp
   src/editor_background.cpp
   src/touch_census.cpp
+  src/aim_trace.cpp
 )
 target_include_directories(network_fixes PRIVATE src)
 target_compile_definitions(network_fixes PRIVATE SWML_NET_FIXES=1 SWML_NET_DIAG=0)

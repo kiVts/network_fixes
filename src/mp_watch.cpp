@@ -3,6 +3,7 @@
 #include "hooks.h"
 #include "log.h"
 #include "net_shared.h"
+#include "aim_trace.h"
 #include "sdk.h"
 
 #include <windows.h>
@@ -298,6 +299,7 @@ void __fastcall simulate_detour(U a1, U a2, U a3, U a4, U a5, U a6, U a7, U a8, 
     o_simulate(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12);
     double ms = now_ms() - t0;
     tl_sim += ms;
+    aim_trace_sample(a1, a3, *g_is_host != 0);
     std::lock_guard lock(g_mu);
     g_simulate.add(ms);
     if (!*g_is_host) g_ticks++;
@@ -345,7 +347,8 @@ void on_begin(void*) { g_update_tid = GetCurrentThreadId(); }
 bool install()
 {
     const wchar_t* ini = settings_ini();
-    if (!GetPrivateProfileIntW(L"mp", L"log", 1, ini)) {
+    const bool aim_trace = aim_trace_install();
+    if (!GetPrivateProfileIntW(L"mp", L"log", 1, ini) && !aim_trace) {
         swlog("mp watch: off in settings.ini");
         return true;
     }
