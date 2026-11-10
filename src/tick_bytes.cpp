@@ -3,6 +3,7 @@
 #include "hooks.h"
 #include "log.h"
 #include "sdk.h"
+#include "logic_trace.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -113,6 +114,7 @@ void measure_ring(const void* player, const uint8_t* ring, int ch)
         uint8_t* msg = const_cast<uint8_t*>(data[(first + i) % cap]);
         if (!msg) continue;
         uint32_t type = *reinterpret_cast<const uint32_t*>(msg + 8);
+        if(ch==0 && type==kCorrection)logic_trace_correction(reinterpret_cast<uintptr_t>(msg),*reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(player)+0x80),true,0);
         bool truncated = false;
         int64_t b = written(msg, truncated);
         if (b < 0) {
@@ -208,7 +210,7 @@ void __fastcall send_detour(void* session)
 
 bool install()
 {
-    if (!GetPrivateProfileIntW(L"measure", L"tick_bytes", 1, settings_ini())) {
+    if (!GetPrivateProfileIntW(L"capture",L"enabled",0,settings_ini()) && !GetPrivateProfileIntW(L"measure", L"tick_bytes", 1, settings_ini())) {
         swlog("tick bytes: off in settings.ini");
         return true;
     }

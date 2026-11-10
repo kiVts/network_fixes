@@ -4,6 +4,7 @@
 #include "vehicle_push.h"
 #include "log.h"
 #include "net_shared.h"
+#include "logic_trace.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -1314,9 +1315,11 @@ void __fastcall post_kinematic_detour(uint8_t* scene, uint8_t* so, const double*
             if(valid){memcpy(p.replay,transform,sizeof p.replay);p.replay_valid=true;}
         }
         g_dropped_kin++;
+        logic_trace_scene(reinterpret_cast<uintptr_t>(so),transform,true);
         return;
     }
     g_orig_kin(scene, so, transform);
+    logic_trace_scene(reinterpret_cast<uintptr_t>(so),transform,false);
 }
 
 void __fastcall post_transform_detour(uint8_t* scene, uint8_t* so, const double* transform)
@@ -1327,9 +1330,11 @@ void __fastcall post_transform_detour(uint8_t* scene, uint8_t* so, const double*
             if(valid){memcpy(p.replay,transform,sizeof p.replay);p.replay_valid=true;}
         }
         g_dropped_kin++;
+        logic_trace_scene(reinterpret_cast<uintptr_t>(so),transform,true);
         return;
     }
     g_orig_transform(scene, so, transform);
+    logic_trace_scene(reinterpret_cast<uintptr_t>(so),transform,false);
 }
 
 bool install()

@@ -2,6 +2,7 @@
 // Fixed-size snapshots only on the simulation thread; formatting/disk logging is
 // on a consumer thread. Full queue => drop diagnostic records, never wait.
 #include "aim_trace.h"
+#include "logic_trace.h"
 #include "aim_trace_contract.h"
 #include "game.h"
 #include "hooks.h"
@@ -48,6 +49,7 @@ void body_record(Record& r, uintptr_t b, uint32_t tick, uint32_t vehicle, uint32
 {
     r={}; r.tick=tick; r.vehicle=vehicle; r.body=index; r.host=host;
     const uintptr_t scene=rd<uintptr_t>(b+0x718);
+    logic_trace_catalog_body(b,scene,vehicle,index);
     // Native scene object points back to this body's embedded scene owner.
     if (scene && rd<uintptr_t>(scene+0xc0)==b+0x260) {
         memcpy(r.pose,reinterpret_cast<void*>(scene+0x18),sizeof r.pose);
@@ -117,7 +119,9 @@ bool collect(uintptr_t simulation, uintptr_t player, bool host, Record* out, uin
             if (n!=start) for (uint32_t bi=0;bi<bodies.count;++bi) {
                 if (n==kBatch) { cut=true; return true; }
                 uintptr_t body=at(bodies,bi);
-                if (body) body_record(out[n++],body,tick,id,bi,host);
+                if (body) {
+                    body_record(out[n++],body,tick,id,bi,host);
+                }
             }
         }
         return true;
@@ -182,7 +186,7 @@ bool contract(uintptr_t address, const uint8_t* bytes, size_t size)
 
 bool aim_trace_install()
 {
-    if (!GetPrivateProfileIntW(L"aim_trace",L"enabled",0,settings_ini())) return false;
+    if (!GetPrivateProfileIntW(L"capture",L"enabled",0,settings_ini()) && !GetPrivateProfileIntW(L"aim_trace",L"enabled",0,settings_ini())) return false;
     // Deliberately limited to actual-PE-verified layouts. Future builds fail closed
     // even if a generic function signature happens to continue matching.
     if (game_build()!=0x6a9a9e20 && game_build()!=0x6ae31989) {

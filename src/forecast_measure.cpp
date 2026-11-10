@@ -2,6 +2,7 @@
 #include "hooks.h"
 #include "log.h"
 #include "game.h"
+#include "logic_trace.h"
 
 #include <windows.h>
 #include <intrin.h>
@@ -33,7 +34,7 @@ SetTarget_t g_orig_set = nullptr;
 uintptr_t g_apply_lo = 0, g_apply_hi = 0;
 
 // --- update thread only ------------------------------------------------------------------
-const uint8_t* g_player = nullptr;
+thread_local const uint8_t* g_player = nullptr; // nested apply context belongs to this calling thread
 LARGE_INTEGER g_freq{};
 LONGLONG g_win_start = 0;
 std::unordered_map<uintptr_t, uint32_t> g_last_reach; // body -> reach tick of its previous correction
@@ -45,6 +46,7 @@ std::unordered_set<uintptr_t> g_bodies;
 uint64_t g_count = 0, g_far = 0, g_no_phys = 0, g_bad = 0, g_lead4 = 0, g_lead5 = 0, g_lead_other = 0;
 uint64_t g_layout_ok = 0, g_layout_bad = 0; // since start, not per window
 bool g_off = false;
+bool g_measure = false;
 
 struct Local {
     double xform[16];
@@ -206,13 +208,17 @@ void __fastcall apply_detour(U a1, U a2, U player, U a4, U a5, U a6)
 void __fastcall set_target_detour(uint8_t* body, uint32_t reach, const double* xform)
 {
     uintptr_t ra = reinterpret_cast<uintptr_t>(_ReturnAddress());
-    if (!g_off && g_player && body && xform && ra >= g_apply_lo && ra < g_apply_hi) measure(body, reach, xform);
+    const bool incoming=g_player && body && xform && ra>=g_apply_lo && ra<g_apply_hi;
+    if(incoming)logic_trace_target(reinterpret_cast<uintptr_t>(body),reach,xform,2,reinterpret_cast<uintptr_t>(g_player));
+    if (g_measure && !g_off && incoming) measure(body, reach, xform);
     g_orig_set(body, reach, xform);
+    if(incoming)logic_trace_target(reinterpret_cast<uintptr_t>(body),reach,reinterpret_cast<const double*>(body+0x118),3,reinterpret_cast<uintptr_t>(g_player));
 }
 
 bool install()
 {
-    if (GetPrivateProfileIntW(L"forecast", L"measure", 0, settings_ini()) == 0) {
+    g_measure=GetPrivateProfileIntW(L"forecast",L"measure",0,settings_ini())!=0;
+    if (!GetPrivateProfileIntW(L"capture",L"enabled",0,settings_ini()) && !g_measure) {
         swlog("forecast measure: off ([forecast] measure=0)");
         return true; // off, not failed
     }
@@ -221,7 +227,7 @@ bool install()
     g_apply_hi = g_apply_lo + kApplySize;
     bool ok = hook_game(kApply, reinterpret_cast<void*>(&apply_detour), reinterpret_cast<void**>(&g_orig_apply)) &&
               hook_game(kSetTarget, reinterpret_cast<void*>(&set_target_detour), reinterpret_cast<void**>(&g_orig_set));
-    swlog("forecast measure: %s (replica drift at every host vehicle correction, log only)", ok ? "on" : "FAILED");
+    swlog("forecast measure: %s (correction target observer; aggregate drift=%d, log only)", ok ? "on" : "FAILED",g_measure);
     return ok;
 }
 

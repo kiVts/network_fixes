@@ -301,6 +301,7 @@ bool event_snapshot(uintptr_t ring,uint32_t* counts,uint32_t& total)
 
 void __fastcall apply_detour(U a1, U a2, U a3, U a4, U a5, U a6)
 {
+    logic_trace_received(a5,a3);
     uint32_t counts[0xc4]{},event_count=0;
     const bool details=g_event_details && a5 && event_snapshot(a5,counts,event_count);
     double t0 = now_ms();
