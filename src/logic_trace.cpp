@@ -285,6 +285,7 @@ void write(FILE* f,const Record& r,uint32_t lane)
 }
 void writer()
 {
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
     FILE* file=nullptr;_wfopen_s(&file,g_path,L"wb");
     if(!file) {g_enabled=false;swlog("logic trace: cannot open output file");return;}
     static char buffer[1<<20];setvbuf(file,buffer,_IOFBF,sizeof buffer);
