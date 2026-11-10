@@ -34,3 +34,37 @@ Like what I do?
 <a href="https://buymeacoffee.com/kivts">
   <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" width="120" alt="Buy Me a Coffee">
 </a>
+
+## Turret and laser diagnostics
+
+For a turret/laser disagreement, enable the temporary read-only aim trace on the
+host and every observing client, using the same mod version. Add this to this
+mod's `settings.ini`, then restart the game:
+
+```ini
+[aim_trace]
+enabled=1
+every_ticks=6
+vehicle_id=0
+```
+
+Start with the same settings that showed the problem. With the client standing
+clear of the turret, the host should aim down, hold for five seconds, aim up,
+hold again, and repeat. Note the time and whether the physical turret head also
+points differently, or just the beam. Keep a recording of both views if possible.
+The trace compares internal aim, rotation inputs, stabilization, component mount
+orientation and body/correction transforms at shared host ticks. It records all
+sub-bodies of vehicles containing camera/laser components. It does not change
+simulation state or need Physics Fixes to be enabled.
+
+Check `logs/mods/network_fixes.log` for `aim trace: on` and increasing `records`
+in `aim trace status`. `faults` should stay zero; `dropped` or `truncated` means
+coverage is incomplete. Nonzero `busy_skips` also means a concurrent sample was
+skipped. Stay in the live world during the aim test. In a busy world, set `vehicle_id` to the affected vehicle's
+ID from the initial trace and restart. Builds without verified field layouts
+leave the trace off and explain why in the log.
+
+After reproducing, preserve each machine's `network_fixes.log`, `physics_fixes.log`
+if enabled, and `logs/swml.log`, labelled host/client and player name. Include the
+affected vehicle file or Workshop link. Set `enabled=0` afterwards and restart;
+traces are verbose. A restart archives previous logs, so collect them first.
