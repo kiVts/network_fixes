@@ -17,6 +17,8 @@ namespace {
 constexpr uintptr_t kCatchUp = 0x1408686c0, kClientSend = 0x14023e590, kClockMs = 0x140174f60;
 constexpr uint32_t kLastTick = 0xce490, kQueueCount = 0xce300, kServerStep = 0xce3b0;
 constexpr uint32_t kBacklogTicks = 14; // above this the game's own fast catch-up plays
+constexpr double kGameTickMs = 16.0;   // a host that isn't lagging makes one tick per 16 ms
+constexpr double kStalePaceTicks = 4;  // this far above the target, the measured period is ignored for the game's own
 
 using U = uint64_t;
 using CatchUp_t = void(__fastcall*)(U, U, U, U, U);
@@ -165,17 +167,20 @@ void decide()
     if (!g_win_start) g_win_start = now;
 
     uint32_t n0 = *reinterpret_cast<uint32_t*>(g_game + kQueueCount);
-    if (n0 <= kBacklogTicks) { // during a backlog the window is being reset (below); keep the last estimate
+    if (n0 <= kBacklogTicks) { // during a backlog the window and the estimates are being reset (below)
         update_jitter();
         update_target(now);
     }
 
     uint32_t n = *reinterpret_cast<uint32_t*>(g_game + kQueueCount);
     if (n > kBacklogTicks) {
-        // The game's own catch-up: what arrived during it says nothing about the network's jitter.
+        // The game's own catch-up: what arrived during it says nothing about the network's jitter. The estimates go too:
+        // kept, they would set the pace until 60 new arrivals fit between two backlogs, which they may never do.
         std::lock_guard lock(g_arr_mu);
         g_arrivals.clear();
         g_arr_next = 0;
+        g_jitter_ms = 0;
+        g_period_ms = kGameTickMs;
     }
     g_depth_s = g_depth_s < 0 ? n : g_depth_s + 0.1 * (double(n) - g_depth_s);
     g_calls++;
@@ -206,7 +211,11 @@ void decide()
     double rate = std::clamp(1.0 + 0.06 * (g_depth_s - g_target), 0.8, 1.5);
     g_rate_min = std::min(g_rate_min, rate);
     g_rate_max = std::max(g_rate_max, rate);
-    g_credit = std::min(g_credit + dt / tick_ms * rate, 10.0);
+    // A queue above the target says the host is faster than the period measured so far (it just stopped lagging), and it
+    // says so sooner than the arrivals' window can. At kStalePaceTicks above, any period drains the queue.
+    double stale = std::clamp((g_depth_s - g_target) / kStalePaceTicks, 0.0, 1.0);
+    double pace_ms = tick_ms + (std::min(tick_ms, kGameTickMs) - tick_ms) * stale;
+    g_credit = std::min(g_credit + dt / pace_ms * rate, 10.0);
     uint32_t k = std::min<uint32_t>(static_cast<uint32_t>(g_credit), std::min(n, 10u));
     log_window(now);
     g_on = g_mode == 2 || (g_mode == 1 && redundancy_active());
