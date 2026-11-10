@@ -68,3 +68,46 @@ After reproducing, preserve each machine's `network_fixes.log`, `physics_fixes.l
 if enabled, and `logs/swml.log`, labelled host/client and player name. Include the
 affected vehicle file or Workshop link. Set `enabled=0` afterwards and restart;
 traces are verbose. A restart archives previous logs, so collect them first.
+
+## Control-loop diagnostics
+
+For train ECU/control oscillation, update this mod and Physics Fixes, then enable
+this capture in **Network Fixes** `settings.ini` on host and observers and restart:
+
+```ini
+[logic_trace]
+enabled=1
+vehicle_id=0
+every_ticks=1
+max_mb=256
+```
+
+Zero selects train vehicles automatically. A specific `vehicle_id` selects that
+vehicle instead. Use the configuration that exhibits the problem: the recorder
+does not switch logic modes. It records published body velocity and native port
+values before/after component execution, including numeric/bool ports and every
+number channel and bool bit in composite ports. Worker, unit, execution order,
+shared host tick and actual logic scheduling/fallback reason accompany records.
+Native-loop fallback has only whole-tick snapshots. Private Lua/PID state is not
+included, so a differing output locates an observed boundary rather than proving
+the underlying defect by itself.
+
+Files are `logs/logic_trace_<UTC timestamp>_<pid>.jsonl`. Preserve them alongside
+the network, physics and loader logs and the affected train file/Workshop link.
+Keep a short recording of the set speed, measured speed/RPS, fuel, air and brake
+outputs during the symptom. Collect the files from every participant.
+
+The writer runs separately and never makes the game wait for disk output.
+Unchanged signals are compressed with periodic keyframes. Bounds are 128
+components, 64 supported ports/component, 1024 ports total and 128 bodies; queues
+have 16 producer lanes of 4096 records. Status records report dropped data, read
+faults, truncation, skipped concurrent captures, unsupported ports and observed
+capture-boundary cost. Nonzero loss/fault/truncation makes coverage incomplete.
+The file-size limit stops capture and is reported in the network log. If no
+components are selected, specify the train's vehicle ID. Disable capture after
+the reproduction. Discovery refuses unverified layouts.
+
+Aim capture also records the host's per-peer correction positions, allowing
+host/observer proximity to be checked against actual body-update targets. When
+either trace is active, event-application stalls include native event type counts;
+these identify a slow batch and are not per-event timings.
