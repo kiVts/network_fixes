@@ -54,6 +54,7 @@ constexpr size_t kHashRing = 1024;
 constexpr int kVotesNeeded = 8;
 constexpr size_t kMaxVoteOffsets = 64; // distinct offsets voted for before the count starts over
 constexpr size_t kSyncCopies = 4096;   // copy hashes kept while not synced
+constexpr int kPollBatches = 4; // never starve native receives/sends while channel 11 stays busy
 
 #pragma pack(push, 1)
 struct Header {
@@ -111,6 +112,9 @@ struct Peer {
     uint32_t rel_hash[kHashRing] = {};      // hash of reliable message r (for syncing)
     std::map<int64_t, int> votes;
     std::map<uint32_t, int64_t> copy_time;  // S -> when the copy given to the game arrived (Steam usec)
+    // Exact bytes already delivered from copies, keyed by reliable ordinal. Unlike
+    // guessed sequence offsets, these survive epoch changes and can justify a drop.
+    std::map<uint64_t, std::vector<uint8_t>> delivered;
     // stats
     std::atomic<uint64_t> rescued{0}, dropped_late{0}, copies_in{0}, stalls{0}, stall_ms{0}, stall_max_ms{0};
     // merge audit (network thread writes, status thread reads and resets): what went to the game, in what order
@@ -256,6 +260,13 @@ void audit_given(Peer& p, uint32_t s)
 void flush_held(Peer& p)
 {
     for (auto it = p.held.begin(); it != p.held.end() && it->first == p.next_seq; it = p.held.erase(it)) {
+        if (p.delivered.size() >= kSyncCopies) break; // await reliable acknowledgements; bounded memory
+        const int64_t ordinal = int64_t(it->first) - p.offset;
+        if (ordinal < 0 || uint64_t(ordinal) < p.r) break;
+        const auto* mb = static_cast<const uint8_t*>(it->second);
+        const auto* bytes = *reinterpret_cast<const uint8_t* const*>(mb + kMsgData);
+        const int size = *reinterpret_cast<const int*>(mb + kMsgSize);
+        p.delivered.emplace(uint64_t(ordinal), std::vector<uint8_t>(bytes, bytes + size));
         p.copy_time[it->first] = *reinterpret_cast<const int64_t*>(static_cast<const uint8_t*>(it->second) + kMsgTime);
         g_ready.push_back(it->second);
         p.rescued.fetch_add(1, std::memory_order_relaxed);
@@ -273,6 +284,7 @@ void flush_held(Peer& p)
 
 void stop_copies(Peer& p, const char* why)
 {
+    swml_report_fault(swml(), swml_self());
     if (!p.disabled) swlog("net redundancy: copies from a peer switched off (%s); its reliable stream carries on", why);
     p.disabled = true;
     for (auto& [s, m] : p.held) release(m);
@@ -284,6 +296,7 @@ void reset_receive(Peer& p, uint32_t epoch)
     for (auto& [s, m] : p.held) release(m);
     p.held.clear();
     p.copy_hash.clear();
+    p.copy_time.clear();
     p.votes.clear();
     p.their_epoch = epoch;
     p.a_have_last = false;
@@ -302,6 +315,7 @@ void reset_receive(Peer& p, uint32_t epoch)
 // client stuck on the Spawning screen) and never noticed it leave. The map is also capped now.
 bool vote(Peer& p, int64_t offset)
 {
+    if (!p.delivered.empty()) return false; // settle the previous epoch's twins before adopting another offset
     if (p.votes.size() >= kMaxVoteOffsets && !p.votes.count(offset)) p.votes.clear(); // no consensus: start over
     int mine = ++p.votes[offset];
     if (mine < kVotesNeeded) return false;
@@ -323,8 +337,12 @@ bool vote(Peer& p, int64_t offset)
 void on_copy(Peer& p, const Entry& e, const uint8_t* data, const uint8_t* src_msg)
 {
     p.copies_in.fetch_add(1, std::memory_order_relaxed);
+    if (p.disabled || e.size > kMaxCopy) return;
+    if (hash_bytes(data, e.size) != e.hash) { stop_copies(p, "invalid copy checksum"); return; }
+    if (p.aligned && (e.seq < p.next_seq || uint64_t(e.seq) - p.next_seq >= kSyncCopies)) return;
     bool fresh = p.copy_hash.emplace(e.seq, e.hash).second;
-    if (p.disabled || !fresh) return;
+    if (!fresh) return;
+    while (p.copy_hash.size() > kSyncCopies) p.copy_hash.erase(p.copy_hash.begin());
     if (!p.aligned) {
         while (p.copy_hash.size() > kSyncCopies) p.copy_hash.erase(p.copy_hash.begin()); // pruned by flush_held once synced
         uint64_t lo = p.r > kHashRing ? p.r - kHashRing : 0, match = 0;
@@ -339,7 +357,7 @@ void on_copy(Peer& p, const Entry& e, const uint8_t* data, const uint8_t* src_ms
             p.next_seq = static_cast<uint32_t>(int64_t(p.r) + p.offset); // S of the next reliable message
         return;
     }
-    if (e.seq < p.next_seq || p.held.size() > 4096) return;
+    if (e.seq < p.next_seq || p.held.size() >= kSyncCopies) return;
     void* m = g_alloc(g_utils, e.size);
     if (!m) return;
     uint8_t* mb = static_cast<uint8_t*>(m);
@@ -565,6 +583,17 @@ void on_packet(void* self, const uint8_t* msg, Send_t send)
         return;
     }
     if (h.type != kTicks) return;
+    // Validate the entire bundle before changing merge state or delivering any entry.
+    if (size > int(kMaxPacket) || !h.count || h.count > kCopies) return;
+    size_t checked = sizeof(Header);
+    for (unsigned i = 0; i < h.count; ++i) {
+        if (checked + sizeof(Entry) > size_t(size)) return;
+        Entry e; memcpy(&e, data + checked, sizeof(e)); checked += sizeof(e);
+        if (e.size > kMaxCopy || checked + e.size > size_t(size) ||
+            hash_bytes(data + checked, e.size) != e.hash) return;
+        checked += e.size;
+    }
+    if (checked != size_t(size)) return;
     if (!p.confirmed.exchange(true)) g_manifest_due = true;
     if (h.epoch != p.their_epoch) reset_receive(p, h.epoch);
     g_last_active.store(GetTickCount(), std::memory_order_relaxed);
@@ -588,6 +617,33 @@ void on_reliable(void* msg)
     uint32_t size = static_cast<uint32_t>(*reinterpret_cast<int*>(mb + kMsgSize));
     uint32_t h = hash_bytes(data, size);
     uint64_t r = p.r++;
+    if (auto delivered = p.delivered.find(r); delivered != p.delivered.end()) {
+        const bool same = delivered->second.size() == size &&
+            (size == 0 || !memcmp(delivered->second.data(), data, size));
+        p.delivered.erase(delivered);
+        if (same) {
+            const auto ct = p.copy_time.find(uint32_t(int64_t(r) + p.offset));
+            if (ct != p.copy_time.end()) {
+                const int64_t late_ms = (*reinterpret_cast<const int64_t*>(mb + kMsgTime) - ct->second) / 1000;
+                if (late_ms > 30) {
+                    p.stalls.fetch_add(1, std::memory_order_relaxed);
+                    p.stall_ms.fetch_add(uint64_t(late_ms), std::memory_order_relaxed);
+                    if (uint64_t(late_ms) > p.stall_max_ms.load()) p.stall_max_ms.store(late_ms);
+                }
+                p.copy_time.erase(ct);
+            }
+            p.dropped_late.fetch_add(1, std::memory_order_relaxed);
+            p.a_verified.fetch_add(1, std::memory_order_relaxed);
+            release(msg);
+            if (p.aligned && !p.disabled) flush_held(p);
+            return;
+        }
+        // A wrong copy may already have affected the world; it cannot be undone.
+        // Still deliver the authoritative update instead of silently losing it.
+        stop_copies(p, "delivered copy differed from reliable bytes; reliable update retained");
+        p.aligned = false;
+        p.votes.clear();
+    }
     if (!p.aligned) {
         p.rel_hash[r % kHashRing] = h;
         if (!p.disabled && !p.copy_hash.empty()) {
@@ -612,21 +668,12 @@ void on_reliable(void* msg)
     auto ch = p.copy_hash.find(static_cast<uint32_t>(s));
     if (ch != p.copy_hash.end() && ch->second != h && !p.disabled) stop_copies(p, "a copy didn't match its reliable message");
     if (s < int64_t(p.next_seq)) {
-        p.dropped_late.fetch_add(1, std::memory_order_relaxed); // the game already has it, from its copy
-        // Its copy's hash was checked against this message above (a difference switches copies off).
-        (ch != p.copy_hash.end() ? p.a_verified : p.a_unrecorded).fetch_add(1, std::memory_order_relaxed);
-        // How much later the reliable copy came: > 30 ms = the reliable stream was stalled (a resend).
-        auto ct = p.copy_time.find(static_cast<uint32_t>(s));
-        if (ct != p.copy_time.end()) {
-            int64_t late_ms = (*reinterpret_cast<const int64_t*>(mb + kMsgTime) - ct->second) / 1000;
-            if (late_ms > 30) {
-                p.stalls.fetch_add(1, std::memory_order_relaxed);
-                p.stall_ms.fetch_add(static_cast<uint64_t>(late_ms), std::memory_order_relaxed);
-                if (uint64_t(late_ms) > p.stall_max_ms.load(std::memory_order_relaxed)) p.stall_max_ms.store(late_ms);
-            }
-            p.copy_time.erase(ct);
-        }
-        release(msg);
+        stop_copies(p, "sequence advanced without a verified delivered copy");
+        p.aligned = false;
+        p.votes.clear();
+        p.a_unrecorded.fetch_add(1, std::memory_order_relaxed);
+        g_ready.push_back(msg);
+        p.a_plain.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     if (s > int64_t(p.next_seq)) {
@@ -688,6 +735,16 @@ void dup_on_sent(void* self, const void* identity, const void* data, uint32_t si
         g_manifest_due = true;
     }
     p.last_send = now;
+    if (p.next_send_seq == UINT32_MAX) {
+        // Reserve the last value so next_seq never wraps while flushing copies.
+        // Reliable ordinals continue monotonically; the new epoch learns its offset.
+        sdk_disconnect(p);
+        p.epoch += 2;
+        p.next_send_seq = 0;
+        p.recent.clear();
+        p.manifest_sent = false;
+        g_manifest_due = true;
+    }
     uint32_t seq = p.next_send_seq++;
     if (!p.confirmed) {
         if (p.hellos_sent < kMaxHellos && now - p.last_hello > 1000) send_hello(self, p, send);
@@ -777,7 +834,7 @@ void dup_poll(void* self, Receive_t recv, Send_t send)
     push_poll(self, send);
     sdk_poll(self, send);
     void* msgs[64];
-    for (;;) {
+    for (int batch = 0; batch < kPollBatches; ++batch) {
         int n = recv(self, kChannel, msgs, 64);
         for (int i = 0; i < n; i++) {
             on_packet(self, static_cast<const uint8_t*>(msgs[i]), send);

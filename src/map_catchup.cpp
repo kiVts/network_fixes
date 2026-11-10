@@ -150,14 +150,14 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
         g_inline.store(false, std::memory_order_relaxed); // world replay belongs to the worker, so pacing can report
         return;
     }
-    bool editor = client && main && g_editor_tid && editor_front(game);
+    bool editor = client && main && editor_front(game);
     // Set this BEFORE the first call: previously even map_catchup_ms=0 couldn't stop its ten-tick batch.
-    if (editor) InterlockedExchange(g_editor_tid, static_cast<LONG>(GetCurrentThreadId()));
+    if (editor && g_editor_tid) InterlockedExchange(g_editor_tid, static_cast<LONG>(GetCurrentThreadId()));
     LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
-    g_orig(game, a2, a3, a4);
+    __try { g_orig(game, a2, a3, a4); }
+    __finally { if (editor && g_editor_tid) InterlockedExchange(g_editor_tid, 0); }
     if (client && !main) editor_background_world_tick(game);
-    if (editor) InterlockedExchange(g_editor_tid, 0);
     if (!client) return;
     if (!main) { // the update thread's call: the map is closed
         if (g_inline.exchange(false, std::memory_order_relaxed))
@@ -207,15 +207,17 @@ bool install()
     g_main_lo = reinterpret_cast<uintptr_t>(game_ptr<void*>(kMainLoop));
     g_main_hi = g_main_lo + per_build<uintptr_t>(kMainLoopSize, 2984); // build 0x6ae218ec: the loop grew 48 bytes
     g_is_host = game_ptr<const volatile uint8_t*>(kIsHost);
+    if (!g_is_host || !g_main_lo) return false;
+    bool limited = !g_editor_ticks;
     bool ok = hook_game(kTick, reinterpret_cast<void*>(&tick_detour), reinterpret_cast<void**>(&g_orig));
     if (ok && g_editor_ticks) {
-        bool limited = install_editor_limit(game_ptr<uint8_t*>(kCatchUp), 1728, g_editor_ticks);
+        limited = install_editor_limit(game_ptr<uint8_t*>(kCatchUp), 1728, g_editor_ticks);
         swlog("editor catch-up: %s (client foreground screen: at most %d host ticks/frame, no extra calls; world updates retained)",
               limited ? "on" : "FAILED, native cap pattern / allocation unavailable", g_editor_ticks);
     }
     swlog("map catch-up: %s", !ok ? "FAILED" : g_budget_ms ? "on (client, map open and behind: up to the frame budget)" : "off, map open/close logged only");
     if (ok && g_budget_ms) swlog("map catch-up: frame budget %d ms", g_budget_ms);
-    return ok;
+    return ok && limited;
 }
 
 HookRegistrar reg{{"map open catch-up", /*needs_known_build=*/true, &install}};

@@ -1,5 +1,6 @@
 # Stormworks Network Fixes
 
+The stability update verifies exact delivered copies before suppressing reliable updates, bounds receive work and copy queues, synchronizes network startup with shutdown, and hardens editor catch-up handling. Detected mismatches are reported through SWML. Already-applied incorrect copies cannot be rolled back, and a single expensive world tick can still delay an editor frame. Regression tests pass; live multiplayer soak testing remains pending.
 Smoother multiplayer for players with high ping, fast mod downloads when joining, and no long slowdown while a big vehicle spawns.
 
 Vanilla sends everything to each player at one fixed speed through one queue. If a connection can't keep up, Steam resends packets over and over: on a 200 ms connection, Steam put about 4 MB/s on the wire while only 110-190 KB/s arrived. A single ship spawn could also block every game update behind megabytes of vehicle data.

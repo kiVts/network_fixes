@@ -788,6 +788,12 @@ volatile LONG g_stopped = 0;
 using Shutdown_t = void (*)();
 Shutdown_t g_orig_shutdown;
 
+struct SteamRound {
+    bool active;
+    SteamRound() { AcquireSRWLockExclusive(&g_round); active = InterlockedCompareExchange(&g_stopped, 0, 0) == 0; }
+    ~SteamRound() { ReleaseSRWLockExclusive(&g_round); }
+};
+
 void stop_net_thread()
 {
     InterlockedExchange(&g_stopped, 1);
@@ -806,8 +812,11 @@ DWORD WINAPI net_thread(void*)
     HMODULE api = nullptr;
     // Steam may still be initialising; wait up to ~2 minutes.
     for (int i = 0; i < 240 && (!g_msgs || !g_utils); i++) {
+        if (InterlockedCompareExchange(&g_stopped, 0, 0)) return 0;
         if (!api) api = GetModuleHandleW(L"steam_api64.dll");
         if (api) {
+            SteamRound round;
+            if (!round.active) return 0;
             auto get_msgs = reinterpret_cast<GetIface_t>(GetProcAddress(api, "SteamAPI_SteamNetworkingMessages_SteamAPI_v002"));
             auto get_utils = reinterpret_cast<GetIface_t>(GetProcAddress(api, "SteamAPI_SteamNetworkingUtils_SteamAPI_v004"));
             if (get_msgs) g_msgs = get_msgs();
@@ -820,6 +829,9 @@ DWORD WINAPI net_thread(void*)
               g_utils);
         return 0;
     }
+    {
+    SteamRound initialization;
+    if (!initialization.active) return 0;
     g_set_int = reinterpret_cast<SetGlobalInt32_t>(GetProcAddress(api, "SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueInt32"));
     auto get_cfg = reinterpret_cast<GetConfigValue_t>(GetProcAddress(api, "SteamAPI_ISteamNetworkingUtils_GetConfigValue"));
     if (!g_set_int || !get_cfg) {
@@ -907,6 +919,7 @@ DWORD WINAPI net_thread(void*)
               g_rate / 1024, g_start_rate / 1024, remembered / 1024, g_min_rate / 1024, g_max_rate / 1024);
     }
 
+    }
     using clock = std::chrono::steady_clock;
     auto last = clock::now();
     for (int ticks = 1;; ticks++) {
