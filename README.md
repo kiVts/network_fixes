@@ -19,6 +19,8 @@ Client pushing of objects and small vehicles needs [Physics Fixes](https://githu
 
 This will likely trigger your antivirus, but there are no viruses in here. If a game crashes, feel free to make an issue here.
 
+**THIS IS A  WIP MOD. IT IS UNSTABLE.**
+
 To use, install [SWML](https://github.com/kiVts/swml) and add the zip from releases here. I also recommend installing [No Crash Uploads](https://github.com/kiVts/no_crashlog_upload) so you don't upload a crash report with an injected DLL to Geometa (a crash is overwhelmingly likely to be due to one of these mods). Consider other mods as well!
 
 [Physics Fixes](https://github.com/kiVts/physics_fixes)
