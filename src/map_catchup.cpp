@@ -276,7 +276,7 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
         g_editor_budget.observed(last_ms, editor_before, remaining, editor_cap, g_editor_replay_ms);
         g_editor_budget_last_end = GetTickCount();
         g_editor_coop_ticks += editor_before > remaining ? editor_before - remaining : 0;
-        g_editor_coop_overruns += last_ms > g_editor_replay_ms;
+        g_editor_coop_overruns += g_editor_budget.overran();
     }
     if (!editor && g_budget_ms > 0 && queued(game) > kBehind && last_ms < g_budget_ms) {
         g_catchup_frames++;
@@ -293,10 +293,10 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
     g_win_max = std::max(g_win_max, queued(game));
     if (now - g_win_start >= 10000) {
         if (g_editor_frames && g_editor_replay_ms)
-            swlog("editor replay 10s: %llu frames, %llu host ticks removed, backlog %u (max %u); cooperative budget %d ms, max %d ticks/call, %llu overruns; world and UI serialized on main thread",
+            swlog("editor replay 10s: %llu frames, %llu host ticks removed, backlog %u (max %u); cooperative budget %d ms, max %d ticks/call, %llu overruns, fixed cost per call %.1f ms; world and UI serialized on main thread",
                   static_cast<unsigned long long>(g_editor_frames), static_cast<unsigned long long>(g_editor_coop_ticks),
                   queued(game), g_win_max, g_editor_replay_ms, editor_replay::Budget::max_ticks,
-                  static_cast<unsigned long long>(g_editor_coop_overruns));
+                  static_cast<unsigned long long>(g_editor_coop_overruns), g_editor_budget.fixed_ms());
         else if (g_editor_frames)
             swlog("editor catch-up 10s: %llu frames (%.1f fps), %llu limited to at most %d host ticks, no extra calls; backlog now %u (max %u)",
                   static_cast<unsigned long long>(g_frames), g_frames * 1000.0 / (now - g_win_start),
@@ -317,10 +317,11 @@ bool install()
 {
     g_budget_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"map_catchup_ms", 100, settings_ini())), 0, 1000);
     g_editor_ticks = std::clamp(int(GetPrivateProfileIntW(L"net", L"editor_catchup_ticks", 1, settings_ini())), 0, 10);
-    if (GetPrivateProfileIntW(L"net", L"editor_background", 0, settings_ini()) == 2) {
-        g_editor_replay_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"editor_replay_ms", 16, settings_ini())), 0, 50);
-        if (g_editor_replay_ms) g_editor_ticks = 1; // first call / fallback is always one native tick
-    }
+    // Cooperative replay has its own switch since 1.11.9. It used to be editor_background=2, the value that meant
+    // the concurrent background worker up to 1.11.7 (and that 1.11.7 shipped as its default): an override of 2 kept
+    // from then must not quietly start a different, unreleased mode. editor_replay_ms=0 (the default) = off.
+    g_editor_replay_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"editor_replay_ms", 0, settings_ini())), 0, 50);
+    if (g_editor_replay_ms) g_editor_ticks = 1; // first call / fallback is always one native tick
     g_host_map_budget_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"host_map_budget_ms", host_map::default_budget_ms, settings_ini())), 0, 50);
     QueryPerformanceFrequency(&g_freq);
     g_main_lo = reinterpret_cast<uintptr_t>(game_ptr<void*>(kMainLoop));

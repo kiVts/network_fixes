@@ -11,8 +11,8 @@ bool install()
 {
     const int requested = GetPrivateProfileIntW(L"net", L"editor_background", 0, settings_ini());
     if (requested)
-        swlog("editor background: requested %d; using %s (editor and simulation share mutable world/render queues); no background worker or editor hooks installed", requested,
-              requested == 2 ? "LOCAL TEST cooperative inline replay when its native cap is verified" : "fixed-cap inline replay");
+        swlog("editor background: editor_background=%d is no longer used (editor and simulation share mutable world/render queues); editors"
+              " run on the main thread; cooperative replay is [net] editor_replay_ms", requested);
     return true;
 }
 HookRegistrar reg{{"editor replay safety", false, &install}};
