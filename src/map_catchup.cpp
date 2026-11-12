@@ -3,6 +3,7 @@
 #include "hooks.h"
 #include "log.h"
 #include "editor_background.h"
+#include "editor_budget.h"
 #include "host_map_scheduler.h"
 #include "host_map_bridge.h"
 
@@ -34,6 +35,12 @@ uintptr_t g_main_lo = 0, g_main_hi = 0;
 const volatile uint8_t* g_is_host = nullptr;
 int g_budget_ms = 100;
 int g_editor_ticks = 1;
+int g_editor_replay_ms = 0;
+editor_replay::Budget g_editor_budget; // native main thread only
+uintptr_t g_editor_budget_game = 0;
+uint64_t g_editor_budget_epoch = 0;
+DWORD g_editor_budget_last_end = 0;
+uint64_t g_editor_coop_ticks = 0, g_editor_coop_overruns = 0;
 int g_host_map_budget_ms = host_map::default_budget_ms;
 bool g_host_map_ready = false;
 thread_local host_map::Scheduler g_host_map_schedule;
@@ -44,6 +51,7 @@ thread_local uint64_t g_host_map_epoch_seen = 0;
 LARGE_INTEGER g_freq{};
 
 volatile LONG* g_editor_tid = nullptr;
+volatile LONG* g_editor_limit = nullptr;
 
 uint8_t* cap_site(uint8_t* fn, size_t size)
 {
@@ -81,19 +89,22 @@ bool install_editor_limit(uint8_t* fn, size_t size, int ticks)
         0x65, 0x44, 0x8b, 0x3c, 0x25, 0x48, 0, 0, 0,         // mov r15d,gs:[48h] (thread id)
         0x44, 0x3b, 0x3d, 0, 0, 0, 0,                         // cmp r15d,[rip+thread_id]
         0x41, 0xbf, 10, 0, 0, 0,                              // mov r15d,10
-        0x75, 0x06,                                           // jne restore_flags
-        0x41, 0xbf, 0, 0, 0, 0,                               // mov r15d,editor_ticks
+        0x75, 0x07,                                           // jne restore_flags
+        0x44, 0x8b, 0x3d, 0, 0, 0, 0,                         // mov r15d,[rip+editor_limit]
         0x9d,                                                 // popfq
         0xe9, 0, 0, 0, 0};                                    // jmp site+6
     int32_t tid_rel = static_cast<int32_t>(page - 17);
+    int32_t limit_rel = static_cast<int32_t>(page + sizeof(LONG) - 32);
     int32_t back = static_cast<int32_t>(reinterpret_cast<intptr_t>(site + 6) -
                                         reinterpret_cast<intptr_t>(mem + sizeof(code)));
     memcpy(code + 13, &tid_rel, 4);
-    memcpy(code + 27, &ticks, 4);
-    memcpy(code + 33, &back, 4);
+    memcpy(code + 28, &limit_rel, 4);
+    memcpy(code + 34, &back, 4);
     memcpy(mem, code, sizeof(code));
     auto* tid = reinterpret_cast<volatile LONG*>(mem + page);
     *tid = 0;
+    auto* limit = tid + 1;
+    *limit = ticks;
     DWORD old = 0;
     if (!VirtualProtect(mem, page, PAGE_EXECUTE_READ, &old)) {
         VirtualFree(mem, 0, MEM_RELEASE);
@@ -112,6 +123,7 @@ bool install_editor_limit(uint8_t* fn, size_t size, int ticks)
     FlushInstructionCache(GetCurrentProcess(), mem, sizeof(code));
     FlushInstructionCache(GetCurrentProcess(), site, sizeof(jump));
     g_editor_tid = tid;
+    g_editor_limit = limit;
     return true;
 }
 
@@ -153,6 +165,7 @@ void note_inline(U game, DWORD now)
         g_backlog_at_open = queued(game);
         g_frames = g_extra = g_catchup_frames = 0;
         g_editor_frames = 0;
+        g_editor_coop_ticks = g_editor_coop_overruns = 0;
         g_win_max = 0;
         swlog("map open: the game simulates on the render thread now (full-screen map, or a screen such as the editor; backlog %u ticks)", g_backlog_at_open);
     }
@@ -219,12 +232,32 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
         return;
     }
     bool editor = client && main && editor_front(game);
+    bool cooperative = editor && g_editor_replay_ms > 0 && g_editor_tid && g_editor_limit;
+    uint32_t editor_before = 0;
+    int editor_cap = g_editor_ticks;
+    if (main && !editor) { g_editor_budget.reset(); g_editor_budget_game = 0; g_editor_budget_last_end = 0; }
+    if (cooperative) {
+        const auto epoch = g_host_map_epoch.load(std::memory_order_relaxed);
+        const DWORD idle_ms = GetTickCount() - g_editor_budget_last_end;
+        if (g_editor_budget_game != game || g_editor_budget_epoch != epoch ||
+            (g_editor_budget_last_end && idle_ms > 250)) {
+            g_editor_budget.reset(); g_editor_budget_game = game; g_editor_budget_epoch = epoch;
+        }
+        editor_before = queued(game);
+        editor_cap = g_editor_budget.choose(*reinterpret_cast<const uintptr_t*>(game + kFrontState),
+                                            editor_before, g_editor_replay_ms);
+    }
+    if (editor && g_editor_limit) InterlockedExchange(g_editor_limit, editor_cap);
     // Set this BEFORE the first call: previously even map_catchup_ms=0 couldn't stop its ten-tick batch.
     if (editor && g_editor_tid) InterlockedExchange(g_editor_tid, static_cast<LONG>(GetCurrentThreadId()));
     LARGE_INTEGER t0;
     QueryPerformanceCounter(&t0);
     __try { g_orig(game, a2, a3, a4); }
-    __finally { if (editor && g_editor_tid) InterlockedExchange(g_editor_tid, 0); }
+    __finally {
+        if (editor && g_editor_tid) InterlockedExchange(g_editor_tid, 0);
+        if (editor && g_editor_limit) InterlockedExchange(g_editor_limit, g_editor_ticks);
+        if (AbnormalTermination() && cooperative) { g_editor_budget.reset(); g_editor_budget_game = 0; g_editor_budget_last_end = 0; }
+    }
     if (client && !main) editor_background_world_tick(game);
     if (!client) return;
     if (!main) { // the update thread's call: the map is closed
@@ -238,6 +271,13 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
     g_frames++;
     if (editor) g_editor_frames++;
     double last_ms = ms_since(t0.QuadPart); // the game's own call
+    if (cooperative) {
+        const uint32_t remaining = queued(game);
+        g_editor_budget.observed(last_ms, editor_before, remaining, editor_cap, g_editor_replay_ms);
+        g_editor_budget_last_end = GetTickCount();
+        g_editor_coop_ticks += editor_before > remaining ? editor_before - remaining : 0;
+        g_editor_coop_overruns += last_ms > g_editor_replay_ms;
+    }
     if (!editor && g_budget_ms > 0 && queued(game) > kBehind && last_ms < g_budget_ms) {
         g_catchup_frames++;
         while (queued(game) > kBehind && ms_since(t0.QuadPart) + last_ms <= g_budget_ms) {
@@ -252,7 +292,12 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
     }
     g_win_max = std::max(g_win_max, queued(game));
     if (now - g_win_start >= 10000) {
-        if (g_editor_frames)
+        if (g_editor_frames && g_editor_replay_ms)
+            swlog("editor replay 10s: %llu frames, %llu host ticks removed, backlog %u (max %u); cooperative budget %d ms, max %d ticks/call, %llu overruns; world and UI serialized on main thread",
+                  static_cast<unsigned long long>(g_editor_frames), static_cast<unsigned long long>(g_editor_coop_ticks),
+                  queued(game), g_win_max, g_editor_replay_ms, editor_replay::Budget::max_ticks,
+                  static_cast<unsigned long long>(g_editor_coop_overruns));
+        else if (g_editor_frames)
             swlog("editor catch-up 10s: %llu frames (%.1f fps), %llu limited to at most %d host ticks, no extra calls; backlog now %u (max %u)",
                   static_cast<unsigned long long>(g_frames), g_frames * 1000.0 / (now - g_win_start),
                   static_cast<unsigned long long>(g_editor_frames), g_editor_ticks, queued(game), g_win_max);
@@ -263,6 +308,7 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
         g_win_start = now;
         g_frames = g_extra = g_catchup_frames = 0;
         g_editor_frames = 0;
+        g_editor_coop_ticks = g_editor_coop_overruns = 0;
         g_win_max = 0;
     }
 }
@@ -271,6 +317,10 @@ bool install()
 {
     g_budget_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"map_catchup_ms", 100, settings_ini())), 0, 1000);
     g_editor_ticks = std::clamp(int(GetPrivateProfileIntW(L"net", L"editor_catchup_ticks", 1, settings_ini())), 0, 10);
+    if (GetPrivateProfileIntW(L"net", L"editor_background", 0, settings_ini()) == 2) {
+        g_editor_replay_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"editor_replay_ms", 16, settings_ini())), 0, 50);
+        if (g_editor_replay_ms) g_editor_ticks = 1; // first call / fallback is always one native tick
+    }
     g_host_map_budget_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"host_map_budget_ms", host_map::default_budget_ms, settings_ini())), 0, 50);
     QueryPerformanceFrequency(&g_freq);
     g_main_lo = reinterpret_cast<uintptr_t>(game_ptr<void*>(kMainLoop));
@@ -287,6 +337,10 @@ bool install()
         limited = install_editor_limit(game_ptr<uint8_t*>(kCatchUp), 1728, g_editor_ticks);
         swlog("editor catch-up: %s (client foreground screen: at most %d host ticks/frame, no extra calls; world updates retained)",
               limited ? "on" : "FAILED, native cap pattern / allocation unavailable", g_editor_ticks);
+    }
+    if (g_editor_replay_ms) {
+        if (!ok || !limited) { g_editor_replay_ms = 0; swlog("editor replay: native cap unavailable; cooperative mode off"); }
+        else swlog("editor replay: LOCAL TEST cooperative mode on; budget %d ms, max %d ticks per native call; main thread only, one editor callback, no background worker", g_editor_replay_ms, editor_replay::Budget::max_ticks);
     }
     swlog("map catch-up: %s", !ok ? "FAILED" : g_budget_ms ? "on (client, map open and behind: up to the frame budget)" : "off, map open/close logged only");
     if (ok && g_budget_ms) swlog("map catch-up: frame budget %d ms", g_budget_ms);

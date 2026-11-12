@@ -15,6 +15,12 @@ constexpr uintptr_t kIntervalAdd = 0x14074745a; // add eax, 5 ; mov ecx, 0x2d0 (
 constexpr uint8_t kIntervalBytes[] = {0x83, 0xC0, 0x05, 0xB9, 0xD0, 0x02, 0x00, 0x00};
 constexpr DWORD kStepMs = 250, kCalmMs = 3000, kMaxCalmMs = 60000, kBounceMs = 10000;
 
+constexpr uintptr_t kMovedEnough = 0x1407468f0;
+using MovedEnough_t = uint64_t(__fastcall*)(void*, const double*, const double*, uint32_t);
+MovedEnough_t g_orig_moved = nullptr;
+uint32_t g_tolerance_ticks = 2;
+uint64_t g_tightened = 0; // calls answered with a smaller interval than the game's (update thread only)
+
 uint8_t* g_site = nullptr;
 int g_min = 1, g_max = 10, g_queue_ms = 100;
 int g_n = 5; // the byte as it is now (the game's 5 until install sets it)
@@ -63,6 +69,16 @@ void step(DWORD now, int q)
     }
 }
 
+uint64_t __fastcall moved_detour(void* a, const double* last, const double* now, uint32_t interval)
+{
+    const uint32_t limit = std::max(g_tolerance_ticks, static_cast<uint32_t>(g_n));
+    if (interval > limit) {
+        interval = limit;
+        g_tightened++;
+    }
+    return g_orig_moved(a, last, now, interval);
+}
+
 // Update thread, at the start of each loop pass (the host tick that reads the byte runs there too).
 void on_begin(void*)
 {
@@ -78,6 +94,17 @@ bool install()
     g_min = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"net", L"correction_min_ticks", 1, ini)), 1, 5);
     g_max = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"net", L"correction_max_ticks", 10, ini)), g_min, 30);
     g_queue_ms = std::max(10, static_cast<int>(GetPrivateProfileIntW(L"net", L"correction_queue_ms", 100, ini)));
+    // Independent of the interval patch below: the game's own 5 ticks next to a body are kept as the floor when that
+    // patch is off (g_n stays 5).
+    g_tolerance_ticks = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"net", L"correction_tolerance_ticks", 2, ini)), 0, 720);
+    if (!g_tolerance_ticks)
+        swlog("net: vehicle correction tolerance: the game's (grows with the player's distance; correction_tolerance_ticks=0)");
+    else if (hook_game(kMovedEnough, &moved_detour, reinterpret_cast<void**>(&g_orig_moved)))
+        swlog("net: vehicle correction tolerance: at most %u tick(s)' worth (%.2f degrees, %u mm) at any distance instead of "
+              "growing with it; how often a far body is sent is unchanged (only matters while hosting)",
+              g_tolerance_ticks, g_tolerance_ticks * 0.0573, g_tolerance_ticks * 2);
+    else
+        swlog("net: vehicle correction tolerance left as the game's (comparison function not found on this build)");
     if (g_min == 5 && g_max == 5) {
         swlog("net: vehicle corrections at the game's rate (correction_min_ticks=5, correction_max_ticks=5)");
         return true;
