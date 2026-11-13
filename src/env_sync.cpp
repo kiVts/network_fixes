@@ -16,7 +16,7 @@ namespace {
 
 constexpr uintptr_t kOceanTick = 0x1402bc810;
 constexpr uintptr_t kOceanTickReturn = 0x1405ea0d6;
-constexpr uintptr_t kTornadoLoad = 0x1402c198a;     // movsd xmm2,[r15+8] ; cvtpd2ps xmm2,xmm2
+constexpr uintptr_t kTornadoLoad = 0x1402c198a;     // the tornado distance (see the top of the file)
 constexpr uint8_t kTornadoBytes[] = {0xf2, 0x41, 0x0f, 0x10, 0x57, 0x08, 0x66, 0x0f, 0x5a, 0xd2};
 constexpr uintptr_t kIsHost = 0x140ceb6ff;
 constexpr size_t kWindX = 0xc024, kWindZ = 0xc028;
@@ -27,7 +27,7 @@ OceanTick_t g_orig = nullptr;
 uintptr_t g_return = 0;
 const volatile uint8_t* g_is_host = nullptr;
 bool g_ocean_sync = true, g_tornado_on = true;
-uint8_t* g_tornado = nullptr; // the disp8 byte, or null when the site isn't there
+uint8_t* g_tornado = nullptr; // the byte the fix rewrites, or null when the site isn't there
 
 // host: its own target, written by the update thread, read by the network thread
 std::atomic<uint32_t> g_host_x{0}, g_host_z{0};

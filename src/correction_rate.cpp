@@ -24,14 +24,9 @@ uint64_t g_tightened = 0; // calls answered with a smaller interval than the gam
 uint8_t* g_site = nullptr;
 int g_min = 1, g_max = 10, g_queue_ms = 100;
 int g_n = 5; // the byte as it is now (the game's 5 until install sets it)
-// Far vehicles (1.11.12): the same expression caps the interval at 720 ticks (the `mov ecx, 0x2d0` after the add):
-// a vehicle a few km from a player is corrected once every 11.5 s, so far ships and radar contacts drift and then
-// jump. While the upload keeps up (n at its minimum) the cap is correction_far_ticks (default 180 = 3 s): one more
-// small message per far moving vehicle every 3 s at most. As soon as n backs off, the game's 720 is back.
-// [net] correction_far_ticks (0 = the game's 720).
 constexpr int kGameFarTicks = 720;
 int g_far = 180;
-int g_far_now = kGameFarTicks; // the imm32 as it is now
+int g_far_now = kGameFarTicks; // the cap as it is now
 
 void set_far(int ticks)
 {
@@ -39,7 +34,7 @@ void set_far(int ticks)
     DWORD old;
     if (!VirtualProtect(g_site + 4, 4, PAGE_EXECUTE_READWRITE, &old)) return;
     uint32_t v = uint32_t(ticks);
-    memcpy(g_site + 4, &v, 4); // mov ecx, imm32; only its two low bytes change, any mix of them is a valid cap (60..720)
+    memcpy(g_site + 4, &v, 4); // only the two low bytes change; any mix of them is a valid cap (60..720)
     VirtualProtect(g_site + 4, 4, old, &old);
     FlushInstructionCache(GetCurrentProcess(), g_site + 4, 4);
     g_far_now = ticks;

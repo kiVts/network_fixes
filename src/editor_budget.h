@@ -3,23 +3,6 @@
 #include <cmath>
 #include <cstdint>
 
-// Admission policy only. Every selected tick still runs in the game's one native call on the
-// main thread, followed by its one editor callback. No concurrent world access or extra UI passes.
-//
-// A native call costs a fixed part (receiving, the editor's own update, UI events) plus the ticks it
-// replays. Up to 1.11.8 the whole call was divided by its ticks: with a fixed part over the budget a
-// call of one tick always "overran", the estimate never fell and the mode never admitted a second
-// tick (2026-11-12 audit). The fixed part is now learnt from calls that replayed nothing (the native
-// formula often asks for 0 ticks while the backlog is small): it follows a lower sample at once and a
-// higher one slowly, so a hidden tick in an ambiguous sample can't inflate it. Unknown = 0, which is
-// the old behaviour.
-//
-// Real time (1.11.11): the native formula plays the ticks its clock says are due, one per 16 ms. A cap of one tick per
-// editor frame lost ground on every frame slower than 16 ms, for good: a 41 fps editor replayed 41 of the host's 62.5
-// ticks/s (2026-11-10 01:38, backlog 45 -> 264 in 20 s). With frame_ms given, the cap also admits the ticks the frame's
-// own length asks for (ceil(frame_ms / 16)), as long as a tick costs less than 16 ms; when ticks cost more, no batch
-// keeps up and the editor's frame rate comes first (one tick). The cap is only an upper bound: the native formula still
-// decides how many are due. Draining a backlog over 14 ticks uses budget_ms on top, as before.
 namespace editor_replay {
 class Budget {
     uintptr_t context_ = 0;

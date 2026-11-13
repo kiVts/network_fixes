@@ -42,9 +42,7 @@ bool patch_piece_size(uint32_t payload)
 }
 
 // --- network loop sleep ------------------------------------------------------------------
-constexpr uintptr_t kSleepJump = 0x14018cc36; // jmp qword ptr [rip+disp32] -> Sleep, ecx = 1
-// Only the opcode is compared: disp32 reaches the IAT slot and differs per build (0x90650b here, 0x90972b in
-// 0x6ae31989), so comparing all 7 bytes switched this off on every later build. The slot is checked to hold Sleep.
+constexpr uintptr_t kSleepJump = 0x14018cc36; // the network loop's Sleep(1)
 constexpr uint8_t kSleepJumpOpcode[] = {0x48, 0xFF, 0x25};
 constexpr size_t kSleepJumpSize = 7;
 constexpr int kMeasureLoops = 200;

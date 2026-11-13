@@ -117,11 +117,6 @@ struct Peer {
     double d_last = 0;
     bool in_transfer = false;
     double xfer_bytes = 0, xfer_time = 0;
-    // 1.11.11: windows the controller doesn't measure. Stalled: the peer sent nothing on channel 0 for > kGapMs during
-    // the window (frozen game, timing out, gone); its Steam queue stops moving, which read as a 0-38 KB/s path and set
-    // the global rate to the 32 KB/s floor (2026-11-10 03:57). Drain: the backlog emptied before the window ended; the
-    // queue's drain counts as that window's delivery and doubled the rate at the end of a 545 KB/s transfer
-    // (issue_1 16:34:43, 1024 -> 2048 KB/s).
     bool win_stalled = false, last_tick_busy = false;
     uint32_t skipped_stalled = 0, skipped_drain = 0; // since the last status line
     RealTimeStatus st{};
@@ -517,9 +512,6 @@ void end_window()
         // Nothing queued: hold the rate. After a long pause the path may have changed, so the next
         // transfer probes upward again (gently, from the current rate).
         ++g_idle_windows;
-        // A player left, or 30 s idle, with the rate under the session's start: whatever pulled it down (that player's
-        // path, a stall) is gone, and the next join would crawl up x1.25/s from there (2026-11-10 03:59: 32 KB/s ->
-        // a 1437 KB world in 11.2 s on a ~450 KB/s path). Start over from the session's start rate.
         if ((g_peer_left || g_idle_windows == 30) && g_rate < g_session_start * 0.98) {
             const char* why = g_peer_left ? "a player left" : "30 s idle";
             g_mode = Mode::startup;
@@ -551,9 +543,6 @@ void end_window()
         g_phase = (g_phase + 1) % kCruisePhases;
         apply_rate(bw * kCruiseGain[g_phase], nullptr);
     }
-    // Cruise: bw is the path's measured capacity. Startup / probe-up windows are no longer saved as a lower bound
-    // (1.11.11): they read high and only ever raised the saved value, so a later session started at 2048 KB/s on a
-    // ~450 KB/s path (2026-11-10 01:35). A completed transfer's average saves the lower bound instead (tick()).
     if (bw < 1e17 && g_mode == Mode::cruise) save_capacity(bw, true);
     g_window_rate = g_rate;
 }
