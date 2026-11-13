@@ -16,7 +16,7 @@ namespace {
 
 constexpr uintptr_t kOceanTick = 0x1402bc810;
 constexpr uintptr_t kOceanTickReturn = 0x1405ea0d6;
-constexpr uintptr_t kTornadoLoad = 0x1402c198a;     // the tornado distance (see the top of the file)
+constexpr uintptr_t kTornadoLoad = 0x1402c198a;     // the tornado distance
 constexpr uint8_t kTornadoBytes[] = {0xf2, 0x41, 0x0f, 0x10, 0x57, 0x08, 0x66, 0x0f, 0x5a, 0xd2};
 constexpr uintptr_t kIsHost = 0x140ceb6ff;
 constexpr size_t kWindX = 0xc024, kWindZ = 0xc028;
