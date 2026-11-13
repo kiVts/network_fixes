@@ -24,12 +24,33 @@ uint64_t g_tightened = 0; // calls answered with a smaller interval than the gam
 uint8_t* g_site = nullptr;
 int g_min = 1, g_max = 10, g_queue_ms = 100;
 int g_n = 5; // the byte as it is now (the game's 5 until install sets it)
+// Far vehicles (1.11.12): the same expression caps the interval at 720 ticks (the `mov ecx, 0x2d0` after the add):
+// a vehicle a few km from a player is corrected once every 11.5 s, so far ships and radar contacts drift and then
+// jump. While the upload keeps up (n at its minimum) the cap is correction_far_ticks (default 180 = 3 s): one more
+// small message per far moving vehicle every 3 s at most. As soon as n backs off, the game's 720 is back.
+// [net] correction_far_ticks (0 = the game's 720).
+constexpr int kGameFarTicks = 720;
+int g_far = 180;
+int g_far_now = kGameFarTicks; // the imm32 as it is now
+
+void set_far(int ticks)
+{
+    if (!g_site || ticks == g_far_now) return;
+    DWORD old;
+    if (!VirtualProtect(g_site + 4, 4, PAGE_EXECUTE_READWRITE, &old)) return;
+    uint32_t v = uint32_t(ticks);
+    memcpy(g_site + 4, &v, 4); // mov ecx, imm32; only its two low bytes change, any mix of them is a valid cap (60..720)
+    VirtualProtect(g_site + 4, 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), g_site + 4, 4);
+    g_far_now = ticks;
+}
 DWORD g_last_step = 0, g_calm_since = 0;
 DWORD g_calm_needed = kCalmMs, g_last_down = 0, g_last_over = 0;
 int g_worst_queue = 0; // since the last change, for its log line
 
 void set_n(int n, int queue_ms)
 {
+    if (g_far > 0) set_far(n <= g_min ? g_far : kGameFarTicks);
     if (n == g_n) return;
     DWORD old;
     if (!VirtualProtect(g_site + 2, 1, PAGE_EXECUTE_READWRITE, &old)) return;
@@ -97,6 +118,8 @@ bool install()
     // Independent of the interval patch below: the game's own 5 ticks next to a body are kept as the floor when that
     // patch is off (g_n stays 5).
     g_tolerance_ticks = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"net", L"correction_tolerance_ticks", 2, ini)), 0, 720);
+    g_far = static_cast<int>(GetPrivateProfileIntW(L"net", L"correction_far_ticks", 180, ini));
+    g_far = g_far <= 0 ? 0 : std::clamp(g_far, 60, kGameFarTicks);
     if (!g_tolerance_ticks)
         swlog("net: vehicle correction tolerance: the game's (grows with the player's distance; correction_tolerance_ticks=0)");
     else if (hook_game(kMovedEnough, &moved_detour, reinterpret_cast<void**>(&g_orig_moved)))
@@ -119,9 +142,11 @@ bool install()
         return true;
     }
     set_n(g_min, 0);
+    if (g_min == g_n && g_far) set_far(g_far); // set_n returns early when n already was g_min
     swlog("net: vehicle corrections: nearby vehicles every %d tick(s) instead of 5 while the upload keeps up, up to every %d "
-          "when a player's send queue passes %d ms (only matters while hosting)",
-          g_min, g_max, g_queue_ms);
+          "when a player's send queue passes %d ms (only matters while hosting); far vehicles at least every %d ticks "
+          "instead of 720 while the upload keeps up",
+          g_min, g_max, g_queue_ms, g_far ? g_far : kGameFarTicks);
     return true;
 }
 

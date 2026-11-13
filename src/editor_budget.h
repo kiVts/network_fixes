@@ -13,6 +13,13 @@
 // formula often asks for 0 ticks while the backlog is small): it follows a lower sample at once and a
 // higher one slowly, so a hidden tick in an ambiguous sample can't inflate it. Unknown = 0, which is
 // the old behaviour.
+//
+// Real time (1.11.11): the native formula plays the ticks its clock says are due, one per 16 ms. A cap of one tick per
+// editor frame lost ground on every frame slower than 16 ms, for good: a 41 fps editor replayed 41 of the host's 62.5
+// ticks/s (2026-11-10 01:38, backlog 45 -> 264 in 20 s). With frame_ms given, the cap also admits the ticks the frame's
+// own length asks for (ceil(frame_ms / 16)), as long as a tick costs less than 16 ms; when ticks cost more, no batch
+// keeps up and the editor's frame rate comes first (one tick). The cap is only an upper bound: the native formula still
+// decides how many are due. Draining a backlog over 14 ticks uses budget_ms on top, as before.
 namespace editor_replay {
 class Budget {
     uintptr_t context_ = 0;
@@ -21,23 +28,37 @@ class Budget {
     bool fixed_known_ = false;
     bool overran_ = false;
     unsigned cooldown_ = 0;
-    int previous_ = 1;
+    int previous_ = 1; // drain part of the cap (ramps up one tick per frame)
+    int owed_ = 1;     // real-time part of the last cap
 public:
     static constexpr int max_ticks = 4;
-    void reset() { context_ = 0; tick_ms_ = 0; fixed_ms_ = 0; fixed_known_ = false; overran_ = false; cooldown_ = 0; previous_ = 1; }
+    static constexpr double tick_period_ms = 16;
+    void reset() { context_ = 0; tick_ms_ = 0; fixed_ms_ = 0; fixed_known_ = false; overran_ = false; cooldown_ = 0; previous_ = 1; owed_ = 1; }
     double fixed_ms() const { return fixed_known_ ? fixed_ms_ : 0; }
+    double tick_ms() const { return tick_ms_; }
+    int owed() const { return owed_; }
     bool overran() const { return overran_; } // the last observed call's replay part exceeded the budget
-    int choose(uintptr_t context, uint32_t queued, double budget_ms) {
+    // frame_ms: time since the previous editor frame (0 = unknown: one tick of real time).
+    int choose(uintptr_t context, uint32_t queued, double budget_ms, double frame_ms = 0) {
         if (context_ != context) { reset(); context_ = context; }
-        if (queued <= 14 || !(budget_ms > 0)) return previous_ = 1;
+        owed_ = 1;
         if (cooldown_) { --cooldown_; return previous_ = 1; }
         if (!(tick_ms_ > 0)) return previous_ = 1;
-        // Clamp before converting to integer, including extremely cheap synthetic ticks.
-        const int allowed = int(std::clamp(budget_ms / tick_ms_, 1.0, double(max_ticks)));
-        return previous_ = std::min(allowed, previous_ + 1);
+        if (tick_ms_ < tick_period_ms && std::isfinite(frame_ms) && frame_ms > tick_period_ms)
+            owed_ = std::min(max_ticks, int(std::ceil(std::min(frame_ms, 100.0) / tick_period_ms)));
+        int drain = 1;
+        if (queued > 14 && budget_ms > 0) {
+            // Clamp before converting to integer, including extremely cheap synthetic ticks.
+            const int allowed = int(std::clamp(budget_ms / tick_ms_, 1.0, double(max_ticks)));
+            drain = std::min(allowed, previous_ + 1);
+        }
+        previous_ = drain;
+        return std::min(max_ticks, drain + owed_ - 1);
     }
     void observed(double elapsed_ms, uint32_t before, uint32_t after, int cap, double budget_ms) {
         overran_ = false;
+        // Real-time ticks cost less than 16 ms each by construction; only time beyond them counts against the budget.
+        budget_ms += (owed_ - 1) * tick_period_ms;
         if (!std::isfinite(elapsed_ms) || elapsed_ms < 0) { tick_ms_ = 0; cooldown_ = 8; previous_ = 1; overran_ = true; return; }
         // Empty clock polls and arrivals hiding progress are not measurements of a physics tick.
         // Learning a cheap sample from them would over-admit the next burst.

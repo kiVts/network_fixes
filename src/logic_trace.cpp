@@ -14,7 +14,7 @@
 #include <thread>
 
 namespace {
-constexpr uint32_t kComponents=128,kPorts=64,kBodies=128,kLanes=16,kQueue=4096,kTotalPorts=1024;
+constexpr uint32_t kComponents=512,kPorts=64,kBodies=128,kLanes=16,kQueue=4096,kTotalPorts=16384;
 enum Kind : uint32_t { SlotRecord=1,BodyRecord=2,BatchRecord=3,TickRecord=4,InventoryRecord=5,ComponentRecord=6,CorrectionRecord=7,MessageRecord=8,TargetRecord=9 };
 struct Identity { uint32_t vehicle,body; int voxel[3]; uint32_t component_type; };
 struct Record {
@@ -71,6 +71,8 @@ uint32_t g_catalog_count=0;
 std::atomic_flag g_catalog_lock=ATOMIC_FLAG_INIT;
 uint64_t g_limit_bytes=256ull<<20;
 bool g_all=false,g_batch_seen=false;
+bool g_logic_only=false; // [logic_trace] components=logic: microcontrollers, train and logic components only
+uint32_t g_inventory_revision[kComponents]{};
 uint32_t g_mode=UINT32_MAX,g_reason=UINT32_MAX;
 size_t g_world_ring=0,g_slots=0;
 uintptr_t g_world_list=0;
@@ -218,21 +220,28 @@ bool prepare(uintptr_t simulation,uintptr_t player)
                 continue;
             }
             Ring bodies;if(!ring(vehicle,bodies,512))return false;
+            // Pass 0: microcontrollers, train and logic components (the control loop) get the component slots
+            // first; pass 1: every other component with ports, unless [logic_trace] components=logic.
+            for(int pass=0;pass<(g_logic_only?1:2);++pass)
             for(uint32_t bi=0;bi<bodies.n;++bi) {
                 uintptr_t b=at(bodies,bi);if(!b)continue;
                 Identity body_id{};body_id.vehicle=id;body_id.body=bi;
-                logic_trace_catalog_body(b,rd<uintptr_t>(b+0x718),id,bi);
-                if(g_nbodies<kBodies)g_bodies[g_nbodies++]={b,body_id};else g_truncated++;
+                if(pass==0) {
+                    logic_trace_catalog_body(b,rd<uintptr_t>(b+0x718),id,bi);
+                    if(g_nbodies<kBodies)g_bodies[g_nbodies++]={b,body_id};else g_truncated++;
+                }
                 Ring components;if(!ring(b+0x450,components,20000))return false;
                 for(uint32_t ci=0;ci<components.n;++ci) {
-                    if(++scanned>40000) {g_truncated++;return true;}
+                    if(++scanned>80000) {g_truncated++;return true;}
                     uintptr_t c=at(components,ci);if(!c)continue;
+                    uintptr_t vt=rd<uintptr_t>(c),def=rd<uintptr_t>(c+0x58);
+                    const bool control=vt==g_mc || vt==g_train || (vt==g_logic && def);
+                    if(control!=(pass==0))continue;
                     if(!native_object_is_a(reinterpret_cast<void*>(c),"c_scene_vehicle_component_extended_base"))continue;
                     Ring slots;if(!ring(c+g_slots,slots,1024)) {g_faults++;continue;}
                     if(!slots.n)continue;
                     if(g_nactive==kComponents) {g_truncated++;continue;}
                     Identity key=body_id;memcpy(key.voxel,reinterpret_cast<void*>(c+0x18),sizeof key.voxel);
-                    uintptr_t vt=rd<uintptr_t>(c),def=rd<uintptr_t>(c+0x58);
                     key.component_type=vt==g_mc?1000:vt==g_train?1001:vt==g_logic && def?rd<uint32_t>(def+0xe70):1002;
                     Component* out=cache(c,def,key);if(!out) {g_truncated++;continue;}
                     const uint32_t old_count=out->nports;out->nports=0;bool changed=false;
@@ -367,14 +376,22 @@ bool logic_trace_install()
     g_world_ring=game_build()==0x6a9a9e20?0x4ca8:0x4cb0;
     g_vehicle=GetPrivateProfileIntW(L"logic_trace",L"vehicle_id",0,settings_ini());g_all=GetPrivateProfileIntW(L"logic_trace",L"all_vehicles",0,settings_ini())!=0;
     g_every=g_capture?1:std::clamp(int(GetPrivateProfileIntW(L"logic_trace",L"every_ticks",1,settings_ini())),1,60);
-    g_limit_bytes=uint64_t(std::clamp(int(GetPrivateProfileIntW(L"logic_trace",L"max_mb",256,settings_ini())),16,2048))<<20;
-    if(g_capture)g_limit_bytes=uint64_t(std::clamp(int(GetPrivateProfileIntW(L"capture",L"max_mb",1024,settings_ini())),16,2048))<<20;
+    g_limit_bytes=uint64_t(std::clamp(int(GetPrivateProfileIntW(L"logic_trace",L"max_mb",256,settings_ini())),16,65536))<<20;
+    if(g_capture)g_limit_bytes=uint64_t(std::clamp(int(GetPrivateProfileIntW(L"capture",L"max_mb",1024,settings_ini())),16,65536))<<20;
+    wchar_t components[16]{};GetPrivateProfileStringW(L"logic_trace",L"components",L"all",components,16,settings_ini());
+    g_logic_only=_wcsicmp(components,L"logic")==0;
+    // [logic_trace] dir: where the JSONL goes (default the swml log folder); must exist.
+    wchar_t dir[MAX_PATH]{};GetPrivateProfileStringW(L"logic_trace",L"dir",L"",dir,MAX_PATH,settings_ini());
+    size_t dlen=wcslen(dir);while(dlen && (dir[dlen-1]==L'\\' || dir[dlen-1]==L'/' || dir[dlen-1]==L' '))dir[--dlen]=0;
+    const DWORD dattr=dlen?GetFileAttributesW(dir):INVALID_FILE_ATTRIBUTES;
+    if(dlen && (dattr==INVALID_FILE_ATTRIBUTES || !(dattr&FILE_ATTRIBUTE_DIRECTORY))) {swlog("logic trace: dir %ls not found; using the log folder",dir);dlen=0;}
     QueryPerformanceFrequency(&g_frequency);SYSTEMTIME now;GetSystemTime(&now);
-    int n=swprintf_s(g_path,L"%s\\logic_trace_%04u%02u%02uT%02u%02u%02uZ_%lu.jsonl",log_dir(),now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,GetCurrentProcessId());
+    int n=swprintf_s(g_path,L"%s\\logic_trace_%04u%02u%02uT%02u%02u%02uZ_%lu.jsonl",dlen?dir:log_dir(),now.wYear,now.wMonth,now.wDay,now.wHour,now.wMinute,now.wSecond,GetCurrentProcessId());
     if(n<0)return false;
     g_enabled=true;std::thread(writer).detach();
     if(g_capture)swlog("combined capture: ON; corrections for all vehicles hashed; detailed camera/train catalog or capture.vehicle_id=%u; target stages 2=input,3=stored,4=scene forwarded,5=scene suppressed; missing data is not a clean result",g_capture_vehicle);
-    swlog("logic trace: on (every %u host ticks, vehicle_id=%u, auto trains=%d); file %ls; Physics Fixes component adapter required for pre/post-component detail",g_every,g_vehicle,!g_all && !g_vehicle,g_path);
+    swlog("logic trace: on (every %u host ticks, vehicle_id=%u, auto trains=%d, components=%s, up to %u components / %u ports, microcontrollers first, limit %llu MB); file %ls; Physics Fixes component adapter required for pre/post-component detail",
+          g_every,g_vehicle,!g_all && !g_vehicle,g_logic_only?"logic":"all",kComponents,kTotalPorts,static_cast<unsigned long long>(g_limit_bytes>>20),g_path);
     return true;
 }
 void logic_trace_begin(uintptr_t simulation,uintptr_t player,bool host)
@@ -392,12 +409,16 @@ void logic_trace_begin(uintptr_t simulation,uintptr_t player,bool host)
     if(g_tick%g_every)return;
     for(uint32_t i=0;i<g_nactive;++i) {
         Component& c=g_cache[g_active[i]];
+        // The port list only changes with the component's revision: written then, plus a keyframe anchor.
+        uint32_t& written=g_inventory_revision[g_active[i]];
+        if(written!=c.revision || g_tick%g_keyframe==0)
         for(uint32_t start=0;start<c.nports;start+=32) {
             Record inventory=base(InventoryRecord,0,c.id);inventory.port=c.revision;
             inventory.count=std::min(32u,c.nports-start);
             for(uint32_t j=0;j<inventory.count;++j){const Port& p=c.ports[start+j];inventory.bits[j]=p.native_index | (p.kind<<16);}
             submit(inventory);
         }
+        written=c.revision;
         component_sample(c,0,UINT32_MAX,0);
     }
     for(uint32_t i=0;i<g_nbodies;++i)body_sample(g_bodies[i],0);

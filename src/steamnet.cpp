@@ -117,6 +117,13 @@ struct Peer {
     double d_last = 0;
     bool in_transfer = false;
     double xfer_bytes = 0, xfer_time = 0;
+    // 1.11.11: windows the controller doesn't measure. Stalled: the peer sent nothing on channel 0 for > kGapMs during
+    // the window (frozen game, timing out, gone); its Steam queue stops moving, which read as a 0-38 KB/s path and set
+    // the global rate to the 32 KB/s floor (2026-11-10 03:57). Drain: the backlog emptied before the window ended; the
+    // queue's drain counts as that window's delivery and doubled the rate at the end of a 545 KB/s transfer
+    // (issue_1 16:34:43, 1024 -> 2048 KB/s).
+    bool win_stalled = false, last_tick_busy = false;
+    uint32_t skipped_stalled = 0, skipped_drain = 0; // since the last status line
     RealTimeStatus st{};
     // "net channels 5s" (guarded by g_mutex): accepted sends and received messages per channel, and the gaps between
     // channel-0 arrivals by Steam's receive time (host -> player: one per host tick).
@@ -296,15 +303,18 @@ void count_received(int channel, void** out, int n)
             if (out[i]) b += uint32_t(*reinterpret_cast<const int*>(static_cast<const uint8_t*>(out[i]) + 0x8));
         g_bulk_in.fetch_add(b, std::memory_order_relaxed);
     }
-    if (!g_log_channels || n <= 0 || !out || channel < 0 || channel > 15) return;
+    // Channel 0 is always tracked: the rate controller needs to know which peers still answer (Peer::win_stalled).
+    if (n <= 0 || !out || channel < 0 || channel > 15 || (!g_log_channels && channel != 0)) return;
     std::lock_guard lock(g_mutex);
     for (int i = 0; i < n; i++) {
         const uint8_t* m = static_cast<const uint8_t*>(out[i]);
         if (!m) continue;
         Peer* p = find_peer_locked(m + 0x10); // SteamNetworkingMessage_t::m_identityPeer
         if (!p) continue;
-        p->in_n[channel]++;
-        p->in_b[channel] += uint32_t(*reinterpret_cast<const int*>(m + 0x8));
+        if (g_log_channels) {
+            p->in_n[channel]++;
+            p->in_b[channel] += uint32_t(*reinterpret_cast<const int*>(m + 0x8));
+        }
         if (channel == 0) {
             int64_t t = *reinterpret_cast<const int64_t*>(m + kMsgTimeReceived);
             if (p->ch0_last && t > p->ch0_last) {
@@ -437,6 +447,8 @@ int g_phase = 0;
 double g_rate = 0;        // last applied
 double g_window_rate = 0; // in force during the window being measured
 int g_idle_windows = 0;
+double g_session_start = 0; // the start rate (start_rate()), restored after a player leaves / a long idle
+bool g_peer_left = false;   // a connected peer's session ended since the last idle window
 
 void apply_rate(double rate, const char* why)
 {
@@ -471,7 +483,13 @@ void end_window()
         p.d_last = p.win_dt > 0 ? p.win_delivered / p.win_dt : 0;
         // Backlogged for most of the window: what got delivered while busy is what the path carries at this rate.
         bool was_busy = p.win_busy_ticks * 2 > p.win_ticks;
-        if (was_busy) {
+        if (was_busy && p.win_stalled) {
+            busy++; // a peer that stopped answering says nothing about the path: hold
+            p.skipped_stalled++;
+        } else if (was_busy && !p.last_tick_busy) {
+            busy++; // the backlog drained inside the window: its delivery includes the drain, hold
+            p.skipped_drain++;
+        } else if (was_busy) {
             busy++;
             double d = p.win_busy_dt > 0 ? p.win_busy_delivered / p.win_busy_dt : 0;
             bool full = d >= 0.8 * g_window_rate;
@@ -485,11 +503,12 @@ void end_window()
                 probe_ok = probe_ok && d >= 0.9 * g_window_rate;
             }
         }
-        p.warm = !was_busy;
+        p.warm = !was_busy || p.win_stalled; // after a stall, the first window back may still be ramping up
+        p.win_stalled = false;
         p.win_delivered = p.win_dt = p.win_busy_delivered = p.win_busy_dt = 0;
         p.win_ticks = p.win_busy_ticks = 0;
     }
-    if (busy > 0 && counted == 0) { // only warm-up windows: hold
+    if (busy > 0 && counted == 0) { // only warm-up / stalled / drain windows: hold
         g_idle_windows = 0;
         g_window_rate = g_rate;
         return;
@@ -497,7 +516,22 @@ void end_window()
     if (busy == 0) {
         // Nothing queued: hold the rate. After a long pause the path may have changed, so the next
         // transfer probes upward again (gently, from the current rate).
-        if (++g_idle_windows == 30 && g_mode == Mode::cruise) g_mode = Mode::probe_up;
+        ++g_idle_windows;
+        // A player left, or 30 s idle, with the rate under the session's start: whatever pulled it down (that player's
+        // path, a stall) is gone, and the next join would crawl up x1.25/s from there (2026-11-10 03:59: 32 KB/s ->
+        // a 1437 KB world in 11.2 s on a ~450 KB/s path). Start over from the session's start rate.
+        if ((g_peer_left || g_idle_windows == 30) && g_rate < g_session_start * 0.98) {
+            const char* why = g_peer_left ? "a player left" : "30 s idle";
+            g_mode = Mode::startup;
+            g_phase = 0;
+            for (Peer& q : g_peers) memset(q.bw, 0, sizeof q.bw), q.bw_next = 0;
+            apply_rate(g_session_start, why);
+            g_window_rate = g_rate;
+            g_peer_left = false;
+            return;
+        }
+        g_peer_left = false;
+        if (g_idle_windows == 30 && g_mode == Mode::cruise) g_mode = Mode::probe_up;
         g_window_rate = g_rate;
         return;
     }
@@ -517,9 +551,10 @@ void end_window()
         g_phase = (g_phase + 1) % kCruisePhases;
         apply_rate(bw * kCruiseGain[g_phase], nullptr);
     }
-    // Cruise: bw is the path's measured capacity. Startup / probe-up: what got through in full, a lower bound (a
-    // join that kept up all the way, 2026-10-24 01:13 up to 1046 KB/s, never reaches cruise).
-    if (bw < 1e17) save_capacity(bw, g_mode == Mode::cruise);
+    // Cruise: bw is the path's measured capacity. Startup / probe-up windows are no longer saved as a lower bound
+    // (1.11.11): they read high and only ever raised the saved value, so a later session started at 2048 KB/s on a
+    // ~450 KB/s path (2026-11-10 01:35). A completed transfer's average saves the lower bound instead (tick()).
+    if (bw < 1e17 && g_mode == Mode::cruise) save_capacity(bw, true);
     g_window_rate = g_rate;
 }
 
@@ -559,23 +594,34 @@ void tick(double dt)
         Peer& p = g_peers[i];
         uint64_t added;
         uint32_t held;
+        int64_t ch0_last;
         uint8_t id[kIdentitySize];
         {
             std::lock_guard lock(g_mutex); // a send may be reusing this slot for a new peer
             if (!p.used) continue;
             added = p.added;
             held = p.held;
+            ch0_last = p.ch0_last;
             p.added = 0;
             p.held = 0;
             memcpy(id, p.id, kIdentitySize);
         }
         RealTimeStatus st{};
         int state = g_get_info(g_msgs, id, nullptr, &st);
+        const bool was_live = p.live;
         p.live = state > 0 && state < 4; // connecting / finding route / connected
         if (!p.live) {
+            if (was_live) {
+                g_peer_left = true; // end_window restores the start rate once everything is idle
+                memset(p.bw, 0, sizeof p.bw), p.bw_next = 0;
+                p.warm = true;
+            }
             p.have_last = p.in_transfer = false;
             continue;
         }
+        // Channel 0 from this peer (its inputs to the host / the host's ticks) silent for > kGapMs: it stopped
+        // answering, and so did its acks. Unknown (no clock, nothing received yet) counts as answering.
+        if (g_now_usec && ch0_last && (g_now_usec(g_utils) - ch0_last) / 1000 > kGapMs) p.win_stalled = true;
         p.st = st;
         // Unreliable sends count too: `added` includes them and they share the wire. Counting only the reliable
         // queue made a client whose upload was mostly unreliable measure ~7 KB/s "delivered" out of 32 KB/s on the
@@ -588,20 +634,23 @@ void tick(double dt)
             // as outstanding made every transfer's first second look like a slow path (see the top of the file).
             double allow = g_window_rate * std::clamp(st.ping, 0, 1000) / 1000.0 * 1.25;
             auto waiting = [allow](int64_t q, int64_t unacked) { return double(q) + std::max(0.0, double(unacked) - allow); };
-            double delivered =
+            const double raw =
                 static_cast<double>(added) - (waiting(queued, st.sent_unacked_reliable) - waiting(p.last_queued, p.last_unacked));
-            delivered = std::clamp(delivered, 0.0, 4 * g_max_rate * dt);
+            const double delivered = std::clamp(raw, 0.0, 4 * g_max_rate * dt);
             p.win_delivered += delivered;
             p.win_dt += dt;
             p.win_ticks++;
             // With pacing the backlog waits in the game's queues, so held sends count as busy too.
-            if (st.pending_reliable > 0 || st.pending_unreliable > 0 || held > 0) {
+            p.last_tick_busy = st.pending_reliable > 0 || st.pending_unreliable > 0 || held > 0;
+            if (p.last_tick_busy) {
                 p.win_busy_ticks++;
                 p.win_busy_delivered += delivered;
                 p.win_busy_dt += dt;
             }
+            // Unclamped: over a whole transfer the queue terms cancel out, so the sum is what actually got through
+            // (clamping a tick where the queue grew faster than the game added counted its later drain twice).
             if (p.in_transfer) {
-                p.xfer_bytes += delivered;
+                p.xfer_bytes += raw;
                 p.xfer_time += dt;
             }
         }
@@ -617,8 +666,11 @@ void tick(double dt)
         } else if (p.in_transfer && outstanding < 8 * 1024 && held == 0) {
             p.in_transfer = false;
             if (p.xfer_time > 0.5) {
-                swlog("net peer%d: transfer done: %.0f KB in %.1f s = %.0f KB/s (send rate now %.0f KB/s)", i + 1,
-                      p.xfer_bytes / 1024, p.xfer_time, p.xfer_bytes / 1024 / p.xfer_time, g_rate / 1024);
+                const double goodput = p.xfer_bytes / p.xfer_time;
+                swlog("net peer%d: transfer done: %.0f KB in %.1f s = %.0f KB/s (send rate now %.0f KB/s, %.2fx that)", i + 1,
+                      p.xfer_bytes / 1024, p.xfer_time, goodput / 1024, g_rate / 1024, goodput > 0 ? g_rate / goodput : 0.0);
+                // What a whole transfer delivered is a true lower bound of the path (no in-flight guess in it).
+                if (p.xfer_bytes >= 512 * 1024 && p.xfer_time >= 1.0) save_capacity(goodput, false);
             }
         }
     }
@@ -655,14 +707,18 @@ void log_status()
         const RealTimeStatus& st = p.st;
         uint32_t held = p.held_window;
         p.held_window = 0;
+        const uint32_t stalled = p.skipped_stalled, drained = p.skipped_drain;
+        p.skipped_stalled = p.skipped_drain = 0;
         // quiet when idle
-        if (st.pending_reliable == 0 && st.pending_unreliable == 0 && st.sent_unacked_reliable < 16 * 1024 && held == 0)
+        if (st.pending_reliable == 0 && st.pending_unreliable == 0 && st.sent_unacked_reliable < 16 * 1024 && held == 0 &&
+            !stalled && !drained)
             continue;
         swlog("net peer%d: rate %.0f KB/s (%s, Steam reports %d)  delivered %.0f KB/s (best %.0f)  wire %.0f KB/s  "
-              "backlog %d KB + %d KB unreliable + %d KB unacked  ping %d ms  quality %.2f/%.2f  bulk sends held %u (ticks first)",
+              "backlog %d KB + %d KB unreliable + %d KB unacked  ping %d ms  quality %.2f/%.2f  bulk sends held %u (ticks first)  "
+              "windows not measured: %u peer silent, %u queue drained",
               i + 1, g_rate / 1024, mode_name(g_mode), st.send_rate / 1024, p.d_last / 1024, best_bw(p) / 1024,
               st.out_bytes / 1024, st.pending_reliable / 1024, st.pending_unreliable / 1024, st.sent_unacked_reliable / 1024, st.ping,
-              st.quality_local, st.quality_remote, held);
+              st.quality_local, st.quality_remote, held, stalled, drained);
     }
 }
 
@@ -912,7 +968,8 @@ DWORD WINAPI net_thread(void*)
         if (!dup_enabled()) return 0;
     } else {
         double remembered = 0;
-        apply_rate(start_rate(remembered), "start");
+        g_session_start = start_rate(remembered);
+        apply_rate(g_session_start, "start");
         g_window_rate = g_rate;
         log_config(get_cfg, "after fixes");
         swlog("net: adaptive send rate on: start %.0f KB/s (start_rate_kb %.0f, last measured capacity %.0f KB/s), range %.0f..%.0f KB/s",

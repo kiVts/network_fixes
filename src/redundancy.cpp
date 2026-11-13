@@ -31,6 +31,10 @@ constexpr DWORD kLodCapEveryMs = 1000, kLodSetEveryMs = 100, kLodFreshMs = 3000;
 // host refuses claims with kPushDeny (payload: object keys).
 constexpr uint8_t kPushCap = 7, kPushState = 8, kPushDeny = 9, kPushHostState = 10, kPushForce = 11;
 constexpr uint8_t kSdkCap = 12, kSdkMessage = 13;
+// Shared sea state / tornado fix (env_sync.cpp): the host sends kEnvState (its ocean wind target and flags, 12 bytes)
+// twice a second to players that sent kEnvCap (once a second, empty) within kEnvFreshMs.
+constexpr uint8_t kEnvState = 14, kEnvCap = 15;
+constexpr DWORD kEnvStateEveryMs = 500, kEnvCapEveryMs = 1000, kEnvFreshMs = 3000;
 constexpr DWORD kPushCapEveryMs = 1000, kPushFreshMs = 3000;
 constexpr int kSendReliable = 8;
 constexpr DWORD kBacklogEveryMs = 250;
@@ -127,6 +131,8 @@ struct Peer {
     std::atomic<DWORD> backlog_at{0};
     // distant AI logic: when this peer last said it runs it (kLodCap)
     std::atomic<DWORD> lod_cap_at{0};
+    // shared sea state: when this peer last said it has it (kEnvCap); network thread only
+    DWORD env_cap_at = 0;
     // object push: when this peer (the host) last said it follows pushed objects (kPushCap); network thread only
     DWORD push_cap_at = 0;
     DWORD sdk_cap_at = 0, sdk_cap_sent = 0;
@@ -454,6 +460,45 @@ void lod_poll(void* self, Send_t send)
     }
 }
 
+// Every loop: shared sea state / tornado fix (env_sync.cpp). Host: whether every connected player has it, and its
+// ocean wind target to those that do (2/s, 24 bytes). Client: "I have it" to the host (1/s, 12 bytes).
+DWORD g_env_sent = 0, g_env_cap_sent = 0, g_env_poll_at = 0;
+void env_poll(void* self, Send_t send)
+{
+    if (!env_available()) return;
+    DWORD now = GetTickCount();
+    if (g_env_poll_at && now - g_env_poll_at < 250) return; // 4 passes a second: the lock isn't taken on every loop
+    g_env_poll_at = now;
+    std::lock_guard lock(g_peers_mu);
+    if (env_hosting()) {
+        bool all = true;
+        for (auto& [k, p] : g_peers) {
+            if (!p->last_send || now - p->last_send > kEnvFreshMs) continue; // not in this session
+            if (!p->confirmed || !p->env_cap_at || now - p->env_cap_at > kEnvFreshMs) all = false;
+        }
+        env_set_peers_capable(all);
+        if (now - g_env_sent < kEnvStateEveryMs) return;
+        g_env_sent = now;
+        uint8_t buf[sizeof(Header) + 12];
+        uint32_t n = env_host_payload(buf + sizeof(Header), 12);
+        if (!n) return;
+        for (auto& [k, p] : g_peers) {
+            if (!p->confirmed || !p->env_cap_at || now - p->env_cap_at > kEnvFreshMs) continue;
+            Header h{kMagic, kVersion, kEnvState, 0, p->epoch};
+            memcpy(buf, &h, sizeof(h));
+            send(self, p->identity, buf, uint32_t(sizeof(Header) + n), kSendUnreliableNoNagle, kChannel);
+        }
+        return;
+    }
+    if (now - g_env_cap_sent < kEnvCapEveryMs) return;
+    g_env_cap_sent = now;
+    for (auto& [k, p] : g_peers) {
+        if (!p->confirmed) continue;
+        Header h{kMagic, kVersion, kEnvCap, 0, p->epoch};
+        send(self, p->identity, &h, sizeof(h), kSendUnreliableNoNagle, kChannel);
+    }
+}
+
 // Every loop: as the host, say once a second that pushed objects are followed and send refusals; as a client, send the
 // newest batch of owned objects to the host(s) that said so.
 DWORD g_push_cap_sent = 0;
@@ -549,6 +594,15 @@ void on_packet(void* self, const uint8_t* msg, Send_t send)
     }
     if (h.type == kLodCap) {
         p.lod_cap_at.store(GetTickCount(), std::memory_order_relaxed);
+        return;
+    }
+    if (h.type == kEnvCap) {
+        const DWORD now = GetTickCount();
+        p.env_cap_at = now ? now : 1; // 0 = never
+        return;
+    }
+    if (h.type == kEnvState) {
+        if (!env_hosting()) env_on_host(data + sizeof(Header), uint32_t(size) - uint32_t(sizeof(Header)));
         return;
     }
     if (h.type == kLodSet) {
@@ -839,6 +893,7 @@ void dup_poll(void* self, Receive_t recv, Send_t send)
     send_manifests(self, send);
     lod_poll(self, send);
     push_poll(self, send);
+    env_poll(self, send);
     sdk_poll(self, send);
     void* msgs[64];
     for (int batch = 0; batch < kPollBatches; ++batch) {

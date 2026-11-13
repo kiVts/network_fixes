@@ -42,8 +42,11 @@ bool patch_piece_size(uint32_t payload)
 }
 
 // --- network loop sleep ------------------------------------------------------------------
-constexpr uintptr_t kSleepJump = 0x14018cc36;
-constexpr uint8_t kSleepJumpBytes[] = {0x48, 0xFF, 0x25, 0x0B, 0x65, 0x90, 0x00};
+constexpr uintptr_t kSleepJump = 0x14018cc36; // jmp qword ptr [rip+disp32] -> Sleep, ecx = 1
+// Only the opcode is compared: disp32 reaches the IAT slot and differs per build (0x90650b here, 0x90972b in
+// 0x6ae31989), so comparing all 7 bytes switched this off on every later build. The slot is checked to hold Sleep.
+constexpr uint8_t kSleepJumpOpcode[] = {0x48, 0xFF, 0x25};
+constexpr size_t kSleepJumpSize = 7;
 constexpr int kMeasureLoops = 200;
 
 using Sleep_t = void(WINAPI*)(DWORD);
@@ -127,15 +130,15 @@ bool install()
 
     if (g_loop_us <= 0) return true;
     QueryPerformanceFrequency(&g_freq);
-    if (memcmp(game_ptr<const void*>(kSleepJump), kSleepJumpBytes, sizeof(kSleepJumpBytes)) != 0) {
+    const uint8_t* jmp = game_ptr<const uint8_t*>(kSleepJump);
+    if (!jmp || memcmp(jmp, kSleepJumpOpcode, sizeof(kSleepJumpOpcode)) != 0) {
         swlog("net: network loop sleep site has unexpected bytes - left as is");
         return true;
     }
     // The jump's IAT slot must hold Sleep.
-    const uint8_t* jmp = game_ptr<const uint8_t*>(kSleepJump);
     int32_t disp;
     memcpy(&disp, jmp + 3, 4);
-    void* slot_target = *reinterpret_cast<void* const*>(jmp + sizeof(kSleepJumpBytes) + disp);
+    void* slot_target = *reinterpret_cast<void* const*>(jmp + kSleepJumpSize + disp);
     void* k32 = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "Sleep"));
     HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
     void* kbs = kb ? reinterpret_cast<void*>(GetProcAddress(kb, "Sleep")) : nullptr;

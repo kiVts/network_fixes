@@ -36,6 +36,7 @@ swml_add_mod(network_fixes SOURCES
   src/local_first.cpp
   src/tick_bytes.cpp
   src/object_push.cpp
+  src/env_sync.cpp
   src/editor_background.cpp
   src/touch_census.cpp
   src/aim_trace.cpp

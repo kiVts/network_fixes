@@ -60,3 +60,10 @@ void push_on_host_states(const uint8_t* data,uint32_t size);
 
 uint32_t push_client_force_payload(uint8_t* out,uint32_t cap);
 void push_on_forces(int peer,const uint8_t* data,uint32_t bytes);
+
+// env_sync.cpp <-> redundancy.cpp (network thread): shared sea state and the tornado weather fix.
+bool env_available();                                        // installed on this build
+bool env_hosting();                                          // this PC hosts (or plays alone)
+uint32_t env_host_payload(uint8_t* out, uint32_t cap);       // host: ocean wind target + flags (12 bytes), or 0
+void env_on_host(const uint8_t* data, uint32_t size);        // client: the host's
+void env_set_peers_capable(bool all);                        // host: every connected player has it

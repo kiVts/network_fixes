@@ -41,6 +41,10 @@ uintptr_t g_editor_budget_game = 0;
 uint64_t g_editor_budget_epoch = 0;
 DWORD g_editor_budget_last_end = 0;
 uint64_t g_editor_coop_ticks = 0, g_editor_coop_overruns = 0;
+LONGLONG g_editor_last_frame = 0;           // QPC at the previous editor frame's choose (0 = none since a reset)
+uint64_t g_editor_rt_frames = 0;            // frames whose cap included more than one tick of real time
+double g_editor_frame_ms_sum = 0;           // for the 10 s line's average frame time
+uint64_t g_editor_frame_ms_n = 0;
 int g_host_map_budget_ms = host_map::default_budget_ms;
 bool g_host_map_ready = false;
 thread_local host_map::Scheduler g_host_map_schedule;
@@ -166,6 +170,8 @@ void note_inline(U game, DWORD now)
         g_frames = g_extra = g_catchup_frames = 0;
         g_editor_frames = 0;
         g_editor_coop_ticks = g_editor_coop_overruns = 0;
+        g_editor_rt_frames = g_editor_frame_ms_n = 0;
+        g_editor_frame_ms_sum = 0;
         g_win_max = 0;
         swlog("map open: the game simulates on the render thread now (full-screen map, or a screen such as the editor; backlog %u ticks)", g_backlog_at_open);
     }
@@ -242,10 +248,17 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
         if (g_editor_budget_game != game || g_editor_budget_epoch != epoch ||
             (g_editor_budget_last_end && idle_ms > 250)) {
             g_editor_budget.reset(); g_editor_budget_game = game; g_editor_budget_epoch = epoch;
+            g_editor_last_frame = 0;
         }
+        LARGE_INTEGER frame_now; QueryPerformanceCounter(&frame_now);
+        const double frame_ms = g_editor_last_frame
+            ? double(frame_now.QuadPart - g_editor_last_frame) * 1000.0 / double(g_freq.QuadPart) : 0.0;
+        g_editor_last_frame = frame_now.QuadPart;
         editor_before = queued(game);
         editor_cap = g_editor_budget.choose(*reinterpret_cast<const uintptr_t*>(game + kFrontState),
-                                            editor_before, g_editor_replay_ms);
+                                            editor_before, g_editor_replay_ms, frame_ms);
+        if (frame_ms > 0) g_editor_frame_ms_sum += frame_ms, g_editor_frame_ms_n++;
+        if (g_editor_budget.owed() > 1) g_editor_rt_frames++;
     }
     if (editor && g_editor_limit) InterlockedExchange(g_editor_limit, editor_cap);
     // Set this BEFORE the first call: previously even map_catchup_ms=0 couldn't stop its ten-tick batch.
@@ -293,9 +306,14 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
     g_win_max = std::max(g_win_max, queued(game));
     if (now - g_win_start >= 10000) {
         if (g_editor_frames && g_editor_replay_ms)
-            swlog("editor replay 10s: %llu frames, %llu host ticks removed, backlog %u (max %u); cooperative budget %d ms, max %d ticks/call, %llu overruns, fixed cost per call %.1f ms; world and UI serialized on main thread",
-                  static_cast<unsigned long long>(g_editor_frames), static_cast<unsigned long long>(g_editor_coop_ticks),
-                  queued(game), g_win_max, g_editor_replay_ms, editor_replay::Budget::max_ticks,
+            swlog("editor replay 10s: %llu frames (%.1f ms avg), %llu host ticks replayed (%.1f/s, host makes 62.5), backlog %u (max %u); "
+                  "%llu frames admitted real-time ticks (tick cost %.1f ms, over 16 = one tick per frame); drain budget %d ms, "
+                  "max %d ticks/call, %llu overruns, fixed cost per call %.1f ms",
+                  static_cast<unsigned long long>(g_editor_frames),
+                  g_editor_frame_ms_n ? g_editor_frame_ms_sum / double(g_editor_frame_ms_n) : 0.0,
+                  static_cast<unsigned long long>(g_editor_coop_ticks), g_editor_coop_ticks * 1000.0 / (now - g_win_start),
+                  queued(game), g_win_max, static_cast<unsigned long long>(g_editor_rt_frames), g_editor_budget.tick_ms(),
+                  g_editor_replay_ms, editor_replay::Budget::max_ticks,
                   static_cast<unsigned long long>(g_editor_coop_overruns), g_editor_budget.fixed_ms());
         else if (g_editor_frames)
             swlog("editor catch-up 10s: %llu frames (%.1f fps), %llu limited to at most %d host ticks, no extra calls; backlog now %u (max %u)",
@@ -309,6 +327,8 @@ void __fastcall tick_detour(U game, U a2, U a3, U a4)
         g_frames = g_extra = g_catchup_frames = 0;
         g_editor_frames = 0;
         g_editor_coop_ticks = g_editor_coop_overruns = 0;
+        g_editor_rt_frames = g_editor_frame_ms_n = 0;
+        g_editor_frame_ms_sum = 0;
         g_win_max = 0;
     }
 }
@@ -320,7 +340,8 @@ bool install()
     // Cooperative replay has its own switch since 1.11.9. It used to be editor_background=2, the value that meant
     // the concurrent background worker up to 1.11.7 (and that 1.11.7 shipped as its default): an override of 2 kept
     // from then must not quietly start a different, unreleased mode. editor_replay_ms=0 (the default) = off.
-    g_editor_replay_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"editor_replay_ms", 0, settings_ini())), 0, 50);
+    // 1.11.11: on by default (16): it now keeps real time too, which the fixed one-tick cap couldn't (see editor_budget.h).
+    g_editor_replay_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"editor_replay_ms", 16, settings_ini())), 0, 50);
     if (g_editor_replay_ms) g_editor_ticks = 1; // first call / fallback is always one native tick
     g_host_map_budget_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"host_map_budget_ms", host_map::default_budget_ms, settings_ini())), 0, 50);
     QueryPerformanceFrequency(&g_freq);
@@ -341,7 +362,7 @@ bool install()
     }
     if (g_editor_replay_ms) {
         if (!ok || !limited) { g_editor_replay_ms = 0; swlog("editor replay: native cap unavailable; cooperative mode off"); }
-        else swlog("editor replay: LOCAL TEST cooperative mode on; budget %d ms, max %d ticks per native call; main thread only, one editor callback, no background worker", g_editor_replay_ms, editor_replay::Budget::max_ticks);
+        else swlog("editor replay: adaptive cap on; real-time ticks while a tick costs under 16 ms, plus up to %d ms to drain a backlog, max %d ticks per native call; main thread only, one editor callback, no background worker", g_editor_replay_ms, editor_replay::Budget::max_ticks);
     }
     swlog("map catch-up: %s", !ok ? "FAILED" : g_budget_ms ? "on (client, map open and behind: up to the frame budget)" : "off, map open/close logged only");
     if (ok && g_budget_ms) swlog("map catch-up: frame budget %d ms", g_budget_ms);
