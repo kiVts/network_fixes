@@ -1,45 +1,34 @@
+1.11.13: Reduce client microstutters by adapting buffering to network jitter.
+
+1.11.12: fixes for desyncs the game has on its own. Same waves for everyone: the game sizes every wave in the world from the weather where each player's own camera is, so a joining player could see boats floating above or sunk under the water they were drawn on. The host now sends its sea state to players with this mod (about 50 bytes a second) and they use it (`[env] ocean_sync`). Tornado wind, rain and waves now land around the tornado instead of in a strip of the map; this changes the weather, so it only switches on while every player in the game has this version (`[env] tornado_fix`). Far-away vehicles (a few km) are corrected at least every 3 s instead of every 11.5 s while the host's upload keeps up, so far ships and radar contacts drift less and jump less (`[net] correction_far_ticks`; the game's 11.5 s comes back automatically when the upload is busy). Needs this mod on the host and the joining players. Tested in one multiplayer session (host side): the 1 ms network loop runs, the sea state was sent, the tornado fix switched with the joining player.
+
+1.11.11: stability fixes from a network audit. The adaptive send rate no longer raises itself at the very end of a download (it then overran the link on the next vehicle spawn and froze the joining player), isn't dragged down to its 32 KB/s floor by a player whose game froze or is timing out, and goes back to its start rate after a player leaves, so a rejoin no longer crawls. Editors on a joining player keep up with the host below 60 fps instead of falling further behind the whole time they're open (`[net] editor_replay_ms` is now on by default; 0 = the old one tick per frame). The 1 ms network loop works again on the current game build; it had switched itself off since the October update.
+
+1.11.10: train capture fits large trains: microcontrollers and logic components are picked first (up to 512 components), `[logic_trace] components=logic` leaves the rest out, `dir=` puts the file on another drive, and the size limit goes up to 64 GB. Port lists are written only when they change, so files grow much slower.
+
+1.11.9: Experimental editor catch-up (cooperative replay) fixed and moved to its own setting, `editor_replay_ms` (off by default). An old `editor_background=2` no longer turns it on, and it can now catch up in heavy editors instead of staying at one tick per frame.
+
+1.11.8: Fixes a bunch of potential crashes, an attempted fix for some desyncs, as outlined in one of the issues.
+
 1.11.7: opt-in combined capture switch enables both train/ECU and turret/body diagnostics. Records per-recipient outgoing and decoded incoming vehicle corrections with canonical wire-precision hashes, detailed camera/train body poses, client target input versus stored target, and scene transforms forwarded or suppressed by object push. Component traces include both call boundaries, thread/order and overlapping-call detection. Periodic health messages expose missing train selection or adapter callbacks. Fixed queues, traversal/hash budgets and a configurable file ceiling bound diagnostic work. Normal settings remain unchanged; this release adds evidence, not a claimed desync or ECU fix.
 
 1.11.6: opt-in train/control-loop recorder captures scalar, bool and all 32 composite number channels before/after component calls with Physics Fixes 0.26.7, plus body feedback, host ticks, scheduling/fallback reasons, worker identity and order. Uses bounded per-thread queues, unchanged-value compression, keyframes, explicit data-loss counters and a file-size limit. Native fallback has whole-tick snapshots only; private Lua/PID state is not dumped. Aim captures now include the host correction sender's per-peer positions. Slow event-application batches report their event types while tracing. No desync/ECU fix is claimed; live reproduction remains pending.
 
 1.11.5: adds an opt-in, read-only aim trace for host/client turret and laser disagreements. Records shared host ticks, vehicle/body/component identity, internal aim and rotation inputs, stabilization/tracking, mount orientation and body/correction transforms. Capture and writer queues are bounded, with incomplete coverage reported. Off by default; verified native layouts required. Native executable checks, capture regressions and log-comparison tests pass. This adds diagnostics, not a claimed fix for issue #1; live reproduction is pending.
 
-1.11.4: host fullscreen-map timing now uses bounded same-thread tick batches instead of one tick per map frame. At most four ticks run per frame, with a 32 ms admission budget; host pacing is respected. Set host_map_budget_ms=0 for vanilla behavior. CPU overload and a single expensive native tick can still stall or slow the world. Native-contract and automated multiplayer stress checks passed; live validation remains pending.
-
 1.11.3: multiplayer workbench desync and catch-up stability. Preserves host pacing depth reports while the client is inside a workbench or map (`map_inline_active() && depth <= 14`), preventing the host pacing timer from surging to 62.5 ticks/s and causing runaway backlog desync. Dynamic catch-up headroom scales the pacing ceiling to 40 ms (`catchup_max_tick_ms`) when a client falls behind (> 60 ticks), and the baseline pacing floor is raised to 33 ms (`max_tick_ms`). Redundancy resync now monotonically prunes stale past delivered twin receipts in `vote()` and `on_reliable()`, preventing permanent resync lockout after sequence gaps. Playout buffer decision state and game pointer are bound to thread-local storage, eliminating cross-thread race conditions during catch-up. Peer identity keys are expanded to 32 bytes, supporting direct IPv6 and Tailscale routes without `/64` subnet collisions.
 
 1.11.2: stability audit. A reliable host update is suppressed only when its exact payload was already delivered as a redundant copy; a mismatch stops copies, reports a fault and retains the reliable update. Receipts survive copy-epoch resets. Copy queues and each poll round are bounded, malformed bundles are rejected before delivery, and sequence rollover starts a new epoch. Steam initialization now participates in shutdown synchronization. Editor catch-up suppression works even if the native replay cap cannot install, and the cap's thread scope is cleared after a native exception. Already-applied incorrect copies cannot be rolled back; live multiplayer soak testing remains necessary.
 
-1.11.1: fixes a stutter on a joining player that could start after a lag event and last until they left the game: updates alternating between playing nothing and playing up to 9 host ticks at once. The playout buffer kept the pace it measured while the host was slow and could never measure a new one, because the queue overflowed first. It now forgets that pace with the backlog and stops trusting it as soon as ticks pile up. Only the joining player needs this version.
-
 1.11.0: the touch census (`[touch]`), the client's 180 Hz push substeps (`[push] client_physics_hz`), the vehicle push force and their traces moved here from Physics Fixes. They still run inside its physics hooks, so pushing needs both mods, as before.
 
-1.10.0: provides the SDK v2 namespaced application-message transport through this mod's existing channel-11 receiver. Negotiated peers receive reliable, bounded SDK messages; application callbacks run on the game lane. Session generations reject stale endpoints, Steam backpressure retains unsent packets, and accepted sends complete without replay. Native tick-copy/push message types are unchanged. Both communicating peers need the v2 core and this transport for SDK messaging; ordinary network fixes retain their existing compatibility. See [the SDK guide](../../sdk/README.md) for API and application acknowledgement requirements. Adapter tests use simulated Steam IO; live remote validation remains necessary.
-
 1.9.11: fixes the recorded character launch when a client-owned roller reaches water or relinquishes ownership. Suppressed native targets remain cached; handoff rebases root bodies to those targets and passive wheels coherently through native direct-transform events before restoring driven flags. The driven target is set to the same pose, preventing a stale network correction from becoming collision velocity. Physics Fixes 0.25.10 and its read-only launch recorder are retained.
-
-1.9.12: first implementation of background editor scheduling, OFF by default. [net] editor_background=1 audits
-preview/live game ownership without changing scheduling. Mode 2 is a development prototype: vehicle editor only,
-two exact game builds, distinct preview game world required. It reuses the native update worker, moves the editor
-callback to each main-thread frame, suppresses its replay-thread invocation and joins before state exit/shutdown.
-Shared preview/live worlds are refused and keep 1.9.11's inline fallback. Worker, blocked-replay, zero-tick,
-startup-failure and teardown tests pass. Scene/asset ownership and multiplayer validation are unfinished;
-this is implementation groundwork, not a completed fix for ordinary shared-world editors.
-
-1.9.11: client editors no longer run the map's extra catch-up calls. The first native replay batch is also limited
-to one host tick per editor frame (previously up to ten, outside map_catchup_ms's control). All host updates stay
-queued and normal catch-up resumes on exit. [net] editor_catchup_ticks=0 restores the old behavior. The native cap
-redirect is checked by instruction pattern and scoped to the editor's thread; hosts and fullscreen maps keep their
-existing behavior. This bounds replay batches, not the cost of a single world tick or spawn; it does not move world
-simulation off the render thread. Native stub and transition tests pass; multiplayer editor validation is pending.
 
 1.9.10: held movable objects are excluded from touch ownership, host steering and pallet snapshots so native pickup has sole control. Physics Fixes includes a read-only 32-call local-character launch history (velocity, forces, facing, held item and contacts), dumped on abnormal walking speeds. This is diagnostic coverage for the reported roller launch, not a verified launch fix.
 
 1.9.9: large vehicles retain host authority. The client relays its solved horizontal contact reaction (normal plus friction) for unowned vehicle bodies; the host applies a bounded force at the contact point. No vehicle-size ownership limit is raised. Forces expire after 150 ms, total at most 1500 N per player, and require a nearby remote character and a point within the host body AABB. [push] large_vehicles=0 disables the relay in Network Fixes.
 
 1.9.8: synchronize nearby native movable boxes (including pallets) from host to clients. Vanilla only replays cylinders. Unowned boxes follow host snapshots through native queued transforms and velocities; active client owners ignore host echoes. Snapshots are bounded, MTU-sized, ordered per object and expire after 400 ms. Requires Physics Fixes 0.25.8 for stable client ground contacts.
-
-1.9.7: compatible multiplayer pushing enables host-like 180 Hz collision substeps while the client walks. Native client physics otherwise hard-codes 60 Hz even when the host and UI use 180 Hz. Elapsed time is unchanged. Physics setting [push] client_physics_hz=0 disables refinement. Original GJK and native solver A/B tests did not prevent sinking; analytic contacts and parallel solver are restored.
 
 1.9.6: enable collision filters for passive wheel helpers too (the replay confirmed their client mask was zero).
 Physics Fixes 0.25.5 adds temporary push-support contact diagnostics under [touch] support_audit=1.
@@ -53,13 +42,6 @@ terrain. Clearing the driven flag alone made them fall through the floor. Their 
 release. Native movable boxes are now included: the previous 0xa3 test selected cylinders and rejected pallets.
 The 1.9.3 tile-editor scenery lookup was the wrong container and has been removed. Live ownership logs include the
 actual body flags and group/mask after the physics queue applies the changes.
-
-1.9.3: experimental separate-scenery lookup, superseded by the native movable-box lookup in 1.9.4.
-Direct transform suppression and the passive wheel assembly handling remain.
-Small vehicles include their entire joint-connected assembly. Passive native wheels outside the vehicle body-record
-ring no longer cause a blanket refusal. Their own dynamics stay intact on each PC; only bodies with actual network
-IDs are sent to the host. Driven/kinematic external anchors, static anchors and oversized assemblies stay refused.
-Standing on a replay-driven vehicle still does not initiate ownership. In-game validation is pending.
 
 1.9.2: object push no longer takes over a unit joined to bodies outside it (a bench's wheels: they kept following the
 host's late states and flung it; `[push] outside_joints=1` for the old behaviour), nor what your character stands on.
@@ -90,35 +72,6 @@ the host's set_animation_state echo came back (one round trip + playout late; th
 that writes a character's animation). Now the client's own request is applied to its own character at once, and the
 host's echoes of it are skipped.
 
-1.7.4: Steam's packets capped at 1200 bytes (`[net] mtu_packet_size`). With direct connections on, Steam picked a
-route over Tailscale (IPv6, MTU 1280) where every packet over 1280 bytes was lost: pings and acks got through, the
-world download delivered 0 KB/s and the join timed out (2026-10-31 21:20). Steam sends up to 1300 bytes of payload.
-
-1.7.3: measurements for less data per tick (analysis/TICK_DATA_PLAN.md stage 0, log only): "tick bytes 5s" (host:
-bytes per player per tick on channels 0 and 1 by message type, and how many vehicle corrections repeat a pose already
-sent to that player) and "tick compress 5s" (every 32nd channel-0 message compressed at libdeflate levels 1 and 6).
-`[measure] tick_bytes`, `tick_compress`.
-
-1.7.2: host pacing also watches the upload: a playing player's send queue over `pacing_queue_ms` (250) counts as that
-many ticks behind, so the world slows slightly instead of that player falling 20-56 s behind (2026-10-31: the friend's
-own queue was empty while 8 MB waited in the host's Steam buffer, and pacing saw nothing). Only players that report
-(in the game) count, so a joining player's world download doesn't slow anyone. "host pacing" lines show the send queue.
-
-1.7.1: vehicle corrections follow the upload. 1.6.0's every-tick corrections (5x the game's) took the host's tick stream
-to the friend from ~4 KB/s to ~700 KB/s once 81 vehicle bodies were next to them (2026-10-31), over a Steam relay
-carrying 620-820 KB/s: an 8 MB send queue, everything 8-12 s late on their side (vehicles appearing a few at a time,
-teleports and respawns not answering, walking in bursts). Now the interval rises step by step while any player's send
-queue is over 100 ms (up to every 10 ticks) and comes back down once it stays empty (`[net] correction_max_ticks`,
-`correction_queue_ms`; "vehicle corrections:" lines).
-
-1.7.0: own echo (`[input] skip_own_echo`, `local_seat_look`) and local first (`[input] local_seats`, `local_buttons`,
-`local_tool_sounds`, `local_ladders`, `local_scopes`, `local_doors`) for clients. Fixes from the first session
-(2026-10-31): own echo now finds your character as the local peer's entry in the player ring (it tested +0x288, which
-a client's own character never has: 0 echoes were skipped, walking and turning still came back a round trip late);
-tool sounds copy the sound's name (it was taken for a position: the early sound read the request's freed text and its
-echo never matched, so each played twice); "local first 30s" also reports copies that aged out; host pacing never runs
-on a client (joining right after hosting, the client waited 6.6-7.5 ms per tick for 8 s with the host's old period).
-
 1.6.3: a client with the full-screen map or editor open stops reporting its backlog, so host pacing no longer slows the world for everyone while they look at the map / build.
 
 1.6.2: host pacing's wait shows in the F1 profiler as its own zone, "Waiting for Client", instead of idle time.
@@ -127,8 +80,6 @@ on a client (joining right after hosting, the client waited 6.6-7.5 ms per tick 
 
 1.6.0: host sends nearby vehicles' corrections every tick instead of every 5th, with a reach tick 1 ahead instead of 5: clients (modded or not) show nearby vehicles, their own included, ~64 ms sooner. `[net] correction_min_ticks` (5 = the game's).
 
-1.5.10: runs on the 2026-10-28 game build (0x6ae218ec) through the SDK port table; the main loop grew 48 bytes (map_catchup range check). Rebuild the friend kit too.
-
 # Network Fixes (host)
 
 Smoother multiplayer for players with high ping, fast mod downloads when joining, and no long
@@ -136,10 +87,6 @@ slowdown while a big vehicle spawns.
 
 - **Adaptive send rate.** Steam sends at one fixed speed (default 256 KB/s per player) and has no
   congestion control. If a player's connection can't take that speed, packets are lost and Steam
-  resends them over and over: measured on a 200 ms ping connection, Steam put ~4 MB/s on the wire
-  but only 110-190 KB/s arrived. This mod measures what each player actually receives and keeps the
-  send rate there: it doubles the rate every second while everything arrives, settles on the measured
-  capacity once it doesn't, and probes a little higher every few seconds.
 - **Game updates first.** Steam sends everything to a player in one queue, in order. When a ship
   spawns, the game used to drop megabytes of vehicle data into that queue at once, and every game
   update behind it waited until all of it was sent: at high ping, seconds of a frozen and then
@@ -162,18 +109,8 @@ slowdown while a big vehicle spawns.
   the player's per-tick inputs) is now also sent a second way that doesn't wait for resends, bundled
   with the two before it, so a lost packet costs 16 ms instead. The game receives exactly the same
   messages in the same order as before, just without the wait; each copy is checked against the
-  real message. Offline test at 200 ms ping and 2% loss: worst 1% of updates 347 -> 115 ms late.
-  Players without the mod get nothing extra.
 - **Playout buffer** (joining players). The game plays the host's updates with no safety margin, so
   any late update freezes it, then it plays up to 10x fast to catch up. This keeps just enough
-  updates queued to cover the jitter measured on the connection and changes the game speed slightly
-  (0.8x..1.5x) instead. It only steers while redundant updates arrive (without them it would add
-  delay for little gain); otherwise it only logs (`playout 10s: ...`).
-- **Drift measurement** (joining players, off by default: `[forecast] measure=1`). Logs only, changes
-  nothing. Each time the host corrects a vehicle, it compares the host's position for each body with your
-  PC's own and logs the error every 10 s (`forecast measure 10s: ...`): moving and resting bodies, in cm
-  and degrees, as is and extrapolated by 1 and 2 ticks. This is stage 0 of `analysis/FORECAST_PLAN.md`
-  (client prediction): the drift it measures is the smallest correction prediction could ever reach.
 - **How far behind each player is** (host). Every player's game reports how many of the host's updates it
   has received but not played yet (the "+Nf" in the player list). The host now logs it every 5 s while anyone
   is behind (`players 5s: ...`, once a minute otherwise), and `player N fell behind` / `caught up` when it
@@ -184,12 +121,6 @@ slowdown while a big vehicle spawns.
   version. Other differences are informational: a joining player's game replays the host's physics.
 - **Map catch-up** (joining players). While the full-screen map is open the game simulates on the drawing
   thread, one round per frame, so a player who only just keeps up falls behind the moment the map opens
-  (2026-10-23: 5 fps for 95 s, then a rejoin). Now, while more than 14 updates are waiting, it plays more
-  rounds per frame, up to `map_catchup_ms` (100 ms) of the frame. `map open:` lines show when it happens.
-- **Pushing things, smoother** (1.4.0). The push velocity is measured over the last 5 ticks instead of 1: the
-  host's copy of a remote player moves in uneven steps (its transforms arrive every 5th tick over the network),
-  and one-tick steps turned into jolts of up to 15 m/s that shoved pallets and crates in ways the player never
-  did. A player riding something faster than 15 m/s is left alone (it used to be pushed back into the deck).
 - **Distant AI logic in multiplayer** (1.5.9). With physics_fixes 0.21+ and its `[lod] logic` on, every PC says so on
   channel 11 once a second, and the host sends the vehicles it lets run their logic every Nth tick (with its tick)
   about 10 times a second; each client decimates exactly those. The host only does it while every connected player
@@ -214,19 +145,12 @@ slowdown while a big vehicle spawns.
   216 ms ping: about one round trip of data is on the wire before any of it is acknowledged, so it looked like a
   slow path and the rate settled at 192-256 KB/s on a connection that carries 700-1000. A joining player's world
   and vehicles (~4 MB) took ~11 s instead of ~4-5 s, and every second of that is host ticks they replay after
-  loading. Now bytes in flight count as in flight, and a session starts near the capacity the last one measured.
-  The joining player's playout buffer also ignores the burst of updates that arrives after loading (it used to
-  read it as 1.5-2.6 s of jitter and buffer the maximum for ~20 s after every join).
 - **Audit fixes** (1.5.1). Remote push runs only on the host (a client's copies of other characters are puppets, and
   loose objects are the host's). Host pacing is off by default (`host_pacing=0`): a last resort, it slows the world for
   everyone. `net channels 5s` now includes this mod's own channel 11 (copies, hellos, reports, manifests), which also
-  counts toward the send rate controller. `players 5s` ticks/s is measured over the real time between looks, and
-  `mp host 5s` is only logged while players are connected.
 - **Stress-test timing** (1.5.0, both ends, `[mp]`). Where each tick goes, every 5 s: `mp host 5s` (host tick,
   simulate, players' requests, joins), `mp client 5s` (host updates arrived and the longest gap, ticks simulated,
   queue, catch-up calls, apply and simulate per tick), `mp stall` for any tick or catch-up over 250 ms, and
-  `net channels 5s` (per player and channel both ways). How to read them: `analysis/LOGGING.md`. The audit
-  (`[audit] enabled`) is now off by default.
 - **Send buffer** (default 512 KB): a bigger buffer keeps file transfers flowing.
 - **Receive buffer** (default 1 MB): more room when you are the one joining.
 - **No Nagle delay** on the game's event messages (Steam holds them up to 5 ms by default).
@@ -240,11 +164,3 @@ downloading at once the slowest one sets the pace.
 `network_fixes.log` shows the rate decisions (`net: send rate ...`), a status line per busy player every 5 s
 (including how many bulk sends waited so updates could go first), a summary after every big transfer
 (`transfer done: ... KB/s`) and the network loop timing every minute (`net loop 60s: ...`).
-
-Settings (settings.ini, [net]): `send_buffer_kb`, `recv_buffer_kb`, `rate_control` (1 adaptive,
-0 fixed `send_rate_kb`), `start_rate_kb`, `min_rate_kb`, `max_rate_kb`, `pace_ms` (0 = updates first
-off), `piece_kb` (0 = game's 511 KB pieces), `net_loop_us` (0 = game's Sleep(1)), `nagle_us`
-(-1 = Steam default), `redundancy` (0 = off), `playout` (1 = with redundancy, 2 = always, 0 = log
-only), `playout_min_ticks`, `playout_max_ms`, `map_catchup_ms` (0 = off). `net redundancy peerN 5s:` lines count how many updates
-came from the copies and how late the normal stream would have been for them. `[forecast] measure`
-(0 = off) turns on the drift measurement.
