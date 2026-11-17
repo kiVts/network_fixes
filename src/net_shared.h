@@ -60,6 +60,9 @@ void push_on_host_states(const uint8_t* data,uint32_t size);
 
 uint32_t push_client_force_payload(uint8_t* out,uint32_t cap);
 void push_on_forces(int peer,const uint8_t* data,uint32_t bytes);
+// Second form of the large vehicle push (vehicle_push2.h): to hosts that announce it, from clients that send it.
+uint32_t push_client_force2_payload(uint8_t* out,uint32_t cap);
+void push_on_forces2(int peer,const uint8_t* data,uint32_t bytes);
 
 // env_sync.cpp <-> redundancy.cpp (network thread): shared sea state and the tornado weather fix.
 bool env_available();                                        // installed on this build

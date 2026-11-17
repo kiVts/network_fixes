@@ -2,6 +2,7 @@
 #include "game.h"
 #include "hooks.h"
 #include "vehicle_push.h"
+#include "vehicle_push2.h"
 #include "log.h"
 #include "net_shared.h"
 #include "logic_trace.h"
@@ -61,6 +62,11 @@ constexpr DWORD kReleaseAfterMs = 1000, kForceReleaseMs = 5000, kReleasingMs = 6
 constexpr double kRestSpeed = 0.15, kRestSpin = 0.3, kStillM = 0.01;
 constexpr double kStandM = 0.2; // feet at most this far under the unit's top, above its footprint: standing on it
 constexpr DWORD kStillGapMs = 100;
+// A vehicle held up by something only the host simulates (its wheels' suspension) falls when this PC simulates it. The
+// first kProbeMs of a vehicle claim send nothing; a root that drops or falls in that time goes back before the host sees
+// a state, and while the character keeps touching it (kHostWheelsMs after the last touch) it is pushed through the host.
+constexpr DWORD kProbeMs = 150, kHostWheelsMs = 60000;
+constexpr double kProbeDropM = 0.03, kProbeFallSpeed = 0.5;
 // host
 constexpr DWORD kClaimStaleMs = 400;
 constexpr double kFirstClaimM = 2.0, kLostM = 5.0, kPosGain = 10.0, kRotGain = 10.0, kMaxCorrection = 4.0, kMaxSpin = 20.0,
@@ -497,9 +503,12 @@ struct Unit {
     DWORD since = 0, last_touch = 0, releasing_since = 0;
     double moved_m = 0;
     bool support_logged = false;
+    bool probing = false;      // vehicle claim in its first kProbeMs: simulated here, nothing sent yet
+    bool held_by_host = false; // it fell while probing: going back, never sent
 };
 std::vector<Unit> g_units;                          // update thread (read by the kinematic detour: same thread)
 std::map<uint64_t, DWORD> g_blocked;                // unit key -> denied at
+std::map<uint32_t, DWORD> g_host_wheels;            // vehicle id -> last touched, for vehicles that fell while probing
 // Touched but not owned yet: where the replay had each body (a claim needs it still over two touching ticks).
 struct Seen {
     std::vector<double> p;
@@ -530,7 +539,8 @@ struct PeerSeq {
 std::map<int, PeerSeq> g_peer_seq; // newest batch number per peer, and when it came
 // stats (30 s)
 uint64_t g_taken = 0, g_taken_vehicles = 0, g_released = 0, g_denies_got = 0, g_dropped_kin = 0, g_batches = 0, g_lost = 0,
-         g_no_joints = 0;
+         g_no_joints = 0, g_held_by_host = 0;
+int g_held_logs = 0;
 uint64_t g_h_claims = 0, g_h_steer = 0, g_h_denied = 0, g_h_done = 0, g_h_batches = 0, g_watch_lines = 0;
 double g_h_max_err = 0, g_c_max_moved = 0;
 int g_claim_logs = 0, g_host_claim_logs = 0, g_joint_logs = 0;
@@ -546,11 +556,12 @@ DWORD g_last_stats = 0;
 // Why touched units weren't claimed (30 s counts; the first 3 of each reason logged with the unit).
 enum Refusal {
     kRefLimit, kRefBlocked, kRefWater, kRefMoving, kRefJoints, kRefStatic, kRefBodies, kRefSize, kRefOutside, kRefStanding,
-    kRefCount
+    kRefHostWheels, kRefCount
 };
 const char* const kRefusalNames[kRefCount] = {"already owning the most", "refused lately", "near the sea", "replay moving",
                                               "not joined", "static", "over 10 bodies", "over the size limit",
-                                              "joined to bodies outside it", "standing on it"};
+                                              "joined to bodies outside it", "standing on it",
+                                              "on wheels only the host simulates: pushed through the host"};
 uint64_t g_refused[kRefCount] = {};
 int g_refusal_logs[kRefCount] = {};
 
@@ -693,6 +704,7 @@ bool take(uint8_t* scene, Unit u, DWORD now)
         g_set_ang(scene, p.so, zero); // wakes it
     }
     u.since = u.last_touch = now;
+    u.probing = u.vehicle && (u.parts[0].saved_body_flags & kFlagDriven);
     g_units.push_back(std::move(u));
     (g_units.back().vehicle ? g_taken_vehicles : g_taken)++;
     return true;
@@ -742,6 +754,10 @@ void on_touch(uint8_t* scene, Unit cand, DWORD now, bool standing)
     for (Unit& u : g_units) {
         if (u.vehicle != cand.vehicle || u.entry != cand.entry || u.parts[0].so != cand.parts[0].so) continue;
         if (standing && (u.parts[0].saved_body_flags & kFlagDriven)) return;
+        if (u.held_by_host) { // going back to the host's wheels: not ours again
+            g_host_wheels[u.id] = now;
+            return;
+        }
         u.last_touch = now;
         if (u.releasing_since) { // touched again while releasing: own it again
             u.releasing_since = 0;
@@ -753,6 +769,13 @@ void on_touch(uint8_t* scene, Unit cand, DWORD now, bool standing)
     for (const Unit& u : g_units) (u.vehicle ? vehicles : loose)++;
     Box box = unit_box(cand);
     auto no = [&](Refusal why) { refuse(why, cand.vehicle, cand.id, cand.parts.size(), box); };
+    if (cand.vehicle) {
+        auto held = g_host_wheels.find(cand.id);
+        if (held != g_host_wheels.end()) {
+            held->second = now;
+            return no(kRefHostWheels);
+        }
+    }
     if (cand.vehicle ? vehicles >= kMaxVehiclesOwned : loose >= kMaxLooseOwned) return no(kRefLimit);
     if (g_blocked.count(unit_key(cand))) return no(kRefBlocked);
     if (box.mn[1] < kClaimAboveSeaM) return no(kRefWater);
@@ -925,6 +948,8 @@ void client_tick(uint8_t* world)
         }
     g_denied_in.clear();
     for (auto it = g_blocked.begin(); it != g_blocked.end();) it = now - it->second > kDenyBlockMs ? g_blocked.erase(it) : ++it;
+    for (auto it = g_host_wheels.begin(); it != g_host_wheels.end();)
+        it = now - it->second > kHostWheelsMs ? g_host_wheels.erase(it) : ++it;
 
     Box me[3];
     int nme = 0;
@@ -1072,6 +1097,27 @@ void client_tick(uint8_t* world)
                   *reinterpret_cast<const double*>(p.body + kBodyOrigin + 8));
             u.support_logged = true;
         }
+        if (u.probing && !u.releasing_since) {
+            const Part& root = u.parts[0];
+            WireState s{};
+            body_state(root.body, s);
+            double drop = root.start_p[1] - s.p[1];
+            if (drop > kProbeDropM || s.v[1] < -kProbeFallSpeed) {
+                u.held_by_host = true;
+                u.releasing_since = now;
+                restore_all(scene, u);
+                g_host_wheels[u.id] = now;
+                g_held_by_host++;
+                if (g_held_logs < 5) {
+                    g_held_logs++;
+                    swlog("object push: vehicle %u sinks when simulated here (%.3f m down, %.2f m/s, after %lu ms): it stands on "
+                          "wheels only the host simulates, so it is pushed through the host instead",
+                          u.id, drop, s.v[1], static_cast<unsigned long>(now - u.since));
+                }
+            } else if (now - u.since >= kProbeMs) {
+                u.probing = false;
+            }
+        }
         bool rest = true;
         size_t first = g_out.size();
         for (const Part& p : u.parts) {
@@ -1082,7 +1128,8 @@ void client_tick(uint8_t* world)
             u.moved_m = std::max(u.moved_m, length3(d));
             double v[3] = {s.v[0], s.v[1], s.v[2]}, sp[3] = {s.w[0], s.w[1], s.w[2]};
             rest = rest && length3(v) < kRestSpeed && length3(sp) < kRestSpin;
-            if (p.kind < kJointPart) g_out.push_back(s); // native wheels follow the root by joints
+            // native wheels follow the root by joints; a probing or host-held vehicle sends nothing
+            if (p.kind < kJointPart && !u.probing && !u.held_by_host) g_out.push_back(s);
         }
         bool wet = unit_box(u).mn[1] < kReleaseAboveSeaM;
         if (!u.releasing_since && (wet || now - u.last_touch > (rest ? kReleaseAfterMs : kForceReleaseMs))) {
@@ -1226,6 +1273,7 @@ void host_tick(uint8_t* world)
     int nrc = remote_character_positions(rc, 16);
     collect_host_boxes(objects,rc,nrc,now);
     apply_vehicle_forces(scene,vehicles,rc,nrc,now);
+    apply_vehicle_push2(scene,vehicles,rc,nrc,now);
     if (nrc)
         for (uint32_t i = 0; i < objects.count; i++) {
             uint8_t* e = objects.at(i);
@@ -1262,13 +1310,14 @@ void maybe_log_stats()
               static_cast<unsigned long long>(g_h_claims), static_cast<unsigned long long>(g_h_batches),
               static_cast<unsigned long long>(g_h_steer), g_h_max_err, static_cast<unsigned long long>(g_h_done),
               static_cast<unsigned long long>(g_h_denied), static_cast<unsigned long long>(g_watch_lines));
-    if (!host && (g_taken || g_taken_vehicles || g_released || g_denies_got || g_lost || g_no_joints))
+    if (!host && (g_taken || g_taken_vehicles || g_released || g_denies_got || g_lost || g_no_joints || g_held_by_host))
         swlog("object push 30s (client): %llu objects and %llu vehicles claimed, %llu handed back (farthest moved %.2f m), "
-              "%llu denied by the host, %llu removed while ours, %llu vehicles skipped without joints, %llu host targets "
-              "dropped, %llu batches sent; %zu owned now",
+              "%llu denied by the host, %llu removed while ours, %llu vehicles skipped without joints, %llu on the host's "
+              "wheels (pushed through the host), %llu host targets dropped, %llu batches sent; %zu owned now",
               static_cast<unsigned long long>(g_taken), static_cast<unsigned long long>(g_taken_vehicles),
               static_cast<unsigned long long>(g_released), g_c_max_moved, static_cast<unsigned long long>(g_denies_got),
               static_cast<unsigned long long>(g_lost), static_cast<unsigned long long>(g_no_joints),
+              static_cast<unsigned long long>(g_held_by_host),
               static_cast<unsigned long long>(g_dropped_kin), static_cast<unsigned long long>(g_batches), g_units.size());
     if (!host) {
         char why[400];
@@ -1296,10 +1345,18 @@ void maybe_log_stats()
         swlog("large vehicle push 30s (host): average applied %.1f N, lightest pushed body %.0f kg, largest push %.2f m/s2, "
               "contact up to %.2f m above/below the centre of mass (applied at its height)",
               g_force_sum_n/double(g_force_applied),g_force_min_kg,g_force_max_accel,g_force_max_lever);
+    if(g_push2_samples || g_push2_packets || g_push2_applied || g_push2_rejected)
+        swlog("large vehicle push 30s (%s, second form): %llu samples, %llu packets, %llu host applications (%llu landings), "
+              "%llu rejected; largest push %.0f N, standing weight up to %.0f N, largest landing %.0f N",
+              host?"host":"client",(unsigned long long)g_push2_samples,(unsigned long long)g_push2_packets,
+              (unsigned long long)g_push2_applied,(unsigned long long)g_push2_landings,(unsigned long long)g_push2_rejected,
+              g_push2_max_push,g_push2_max_support,g_push2_max_land);
+    g_push2_samples=g_push2_packets=g_push2_applied=g_push2_landings=g_push2_rejected=0;
+    g_push2_max_push=g_push2_max_support=g_push2_max_land=0;
     g_force_samples=g_force_packets=g_force_applied=g_force_rejected=0;g_force_max_n=0;
     g_force_sum_n=g_force_max_lever=g_force_min_kg=g_force_max_accel=0;
     memset(g_refused, 0, sizeof g_refused);
-    g_taken = g_taken_vehicles = g_released = g_denies_got = g_lost = g_dropped_kin = g_batches = g_no_joints = 0;
+    g_taken = g_taken_vehicles = g_released = g_denies_got = g_lost = g_dropped_kin = g_batches = g_no_joints = g_held_by_host = 0;
     g_h_claims = g_h_steer = g_h_denied = g_h_done = g_h_batches = g_watch_lines = 0;
     g_h_max_err = g_c_max_moved = 0;
 }
@@ -1523,6 +1580,28 @@ uint32_t push_client_force_payload(uint8_t* out,uint32_t cap) {
     WireHeader h{g_force_out_seq,uint16_t(g_force_out.size())};memcpy(out,&h,sizeof h);
     if(!g_force_out.empty())memcpy(out+sizeof h,g_force_out.data(),g_force_out.size()*sizeof(WireVehicleForce));
     g_force_sent_seq=g_force_out_seq;++g_force_packets;return bytes;
+}
+uint32_t push_client_force2_payload(uint8_t* out,uint32_t cap) {
+    std::lock_guard lock(g_mu);
+    if(!g_large_push_on || !g_force_out2_seq || g_force_sent2_seq==g_force_out2_seq)return 0;
+    uint32_t bytes=uint32_t(sizeof(WireHeader)+g_force_out2.size()*sizeof(WireVehiclePush2));if(bytes>cap)return 0;
+    WireHeader h{g_force_out2_seq,uint16_t(g_force_out2.size())};memcpy(out,&h,sizeof h);
+    if(!g_force_out2.empty())memcpy(out+sizeof h,g_force_out2.data(),g_force_out2.size()*sizeof(WireVehiclePush2));
+    g_force_sent2_seq=g_force_out2_seq;++g_push2_packets;return bytes;
+}
+void push_on_forces2(int peer,const uint8_t* data,uint32_t bytes) {
+    if(bytes<sizeof(WireHeader))return;WireHeader h;memcpy(&h,data,sizeof h);
+    if(h.count>16 || bytes!=sizeof h+h.count*sizeof(WireVehiclePush2))return;
+    std::vector<WireVehiclePush2> pushes(h.count);if(h.count)memcpy(pushes.data(),data+sizeof h,h.count*sizeof(WireVehiclePush2));
+    for(const auto& f:pushes) {
+        if(f.body>=4096)return;
+        for(int k=0;k<3;k++)if(!std::isfinite(f.point[k]) || std::fabs(f.point[k])>1000 || !std::isfinite(f.dir[k]) || std::fabs(f.dir[k])>1.01f)return;
+        float more[4]={f.approach,f.support,f.land,f.kg};
+        for(float x:more)if(!std::isfinite(x) || x<0 || x>100000)return;
+    }
+    DWORD now=tick_now();std::lock_guard lock(g_mu);if(!g_large_push_on || !g_is_host || !*g_is_host)return;
+    auto& p=g_peer_push2[peer];if(p.at && now-p.at<=kLargePushFreshMs && int32_t(h.seq-p.seq)<=0)return;
+    p.seq=h.seq;p.at=now;p.pushes=std::move(pushes);++g_push2_packets;
 }
 void push_on_forces(int peer,const uint8_t* data,uint32_t bytes) {
     if(bytes<sizeof(WireHeader))return;WireHeader h;memcpy(&h,data,sizeof h);

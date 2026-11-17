@@ -1,3 +1,9 @@
+1.11.18: Joining players now push vehicles and bounce suspensions as hard as the host.
+
+1.11.17: Walking into a car's wheels no longer crushes its suspension; the host pushes it.
+
+1.11.16: "CATCHING UP..." is now red text on the bottom-left SWML line.
+
 1.11.15: Players no longer push or bounce vehicles they stand on or beside.
 
 1.11.13: Reduce client microstutters by adapting buffering to network jitter.

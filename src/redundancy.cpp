@@ -34,6 +34,9 @@ constexpr uint8_t kSdkCap = 12, kSdkMessage = 13;
 // Shared sea state / tornado fix (env_sync.cpp): the host sends kEnvState (its ocean wind target and flags, 12 bytes)
 // twice a second to players that sent kEnvCap (once a second, empty) within kEnvFreshMs.
 constexpr uint8_t kEnvState = 14, kEnvCap = 15;
+// Large vehicle push, second form (vehicle_push2.h): a host that takes it says so with kPushCap2 next to kPushCap; its
+// clients then send kPushForce2 instead of kPushForce. Older peers ignore both.
+constexpr uint8_t kPushCap2 = 16, kPushForce2 = 17;
 constexpr DWORD kEnvStateEveryMs = 500, kEnvCapEveryMs = 1000, kEnvFreshMs = 3000;
 constexpr DWORD kPushCapEveryMs = 1000, kPushFreshMs = 3000;
 constexpr int kSendReliable = 8;
@@ -130,6 +133,7 @@ struct Peer {
     DWORD env_cap_at = 0;
     // object push: when this peer (the host) last said it follows pushed objects (kPushCap); network thread only
     DWORD push_cap_at = 0;
+    DWORD push_cap2_at = 0; // ... and that it takes the second form of large vehicle pushes
     DWORD sdk_cap_at = 0, sdk_cap_sent = 0;
     uint32_t sdk_remote_epoch = 0;
     bool sdk_registered = false;
@@ -511,6 +515,8 @@ void push_poll(void* self, Send_t send)
             if (cap) {
                 Header h{kMagic, kVersion, kPushCap, 0, p->epoch};
                 send(self, p->identity, &h, sizeof(h), kSendUnreliableNoNagle, kChannel);
+                Header h2{kMagic, kVersion, kPushCap2, 0, p->epoch};
+                send(self, p->identity, &h2, sizeof(h2), kSendUnreliableNoNagle, kChannel);
             }
             uint32_t n = push_take_denies(p->index, buf + sizeof(Header), uint32_t(sizeof(buf) - sizeof(Header)));
             if (!n) continue;
@@ -520,19 +526,25 @@ void push_poll(void* self, Send_t send)
         }
         return;
     }
-    uint8_t force_buf[kMaxPacket];
+    uint8_t force_buf[kMaxPacket], force2_buf[kMaxPacket];
     uint32_t nf=push_client_force_payload(force_buf+sizeof(Header),uint32_t(sizeof(force_buf)-sizeof(Header)));
+    uint32_t nf2=push_client_force2_payload(force2_buf+sizeof(Header),uint32_t(sizeof(force2_buf)-sizeof(Header)));
     uint32_t n = push_client_payload(buf + sizeof(Header), uint32_t(sizeof(buf) - sizeof(Header)));
-    if (!n && !nf) return;
+    if (!n && !nf && !nf2) return;
     for (auto& [k, p] : g_peers) {
         if (!p->confirmed || !p->push_cap_at || now - p->push_cap_at > kPushFreshMs) continue;
         if(n) {
             Header h{kMagic,kVersion,kPushState,0,p->epoch};memcpy(buf,&h,sizeof h);
             send(self,p->identity,buf,uint32_t(sizeof(Header)+n),kSendUnreliableNoNagle,kChannel);
         }
-        if(nf) {
+        bool second = p->push_cap2_at && now - p->push_cap2_at <= kPushFreshMs;
+        if(nf && !second) {
             Header h{kMagic,kVersion,kPushForce,0,p->epoch};memcpy(force_buf,&h,sizeof h);
             send(self,p->identity,force_buf,uint32_t(sizeof(Header)+nf),kSendUnreliableNoNagle,kChannel);
+        }
+        if(nf2 && second) {
+            Header h{kMagic,kVersion,kPushForce2,0,p->epoch};memcpy(force2_buf,&h,sizeof h);
+            send(self,p->identity,force2_buf,uint32_t(sizeof(Header)+nf2),kSendUnreliableNoNagle,kChannel);
         }
     }
 }
@@ -604,6 +616,14 @@ void on_packet(void* self, const uint8_t* msg, Send_t send)
     }
     if (h.type == kPushState) {
         push_on_states(p.index, data + sizeof(Header), uint32_t(size) - uint32_t(sizeof(Header)));
+        return;
+    }
+    if (h.type == kPushCap2) {
+        p.push_cap2_at = GetTickCount();
+        return;
+    }
+    if (h.type == kPushForce2) {
+        if(push_hosting())push_on_forces2(p.index,data+sizeof(Header),uint32_t(size)-uint32_t(sizeof(Header)));
         return;
     }
     if (h.type == kPushForce) {

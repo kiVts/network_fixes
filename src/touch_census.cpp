@@ -6,6 +6,7 @@
 #include "push_step.h"
 #include "sdk.h"
 #include "vehicle_push.h"
+#include "vehicle_push2.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -281,11 +282,19 @@ void __cdecl touch_solver_end() {
 
 void vehicle_push_step_end(const void* world,double fixed) {
     SwmlVehiclePushSample samples[16]{};int n=0;
-    __try {sample_vehicle_reaction(static_cast<const uint8_t*>(world),fixed,samples,n);}
-    __except(EXCEPTION_EXECUTE_HANDLER) {n=0;}
+    VehiclePushSample2 samples2[16]{};int n2=0;
+    __try {sample_vehicle_reaction(static_cast<const uint8_t*>(world),fixed,samples,n,samples2,&n2);}
+    __except(EXCEPTION_EXECUTE_HANDLER) {n=n2=0;}
     AcquireSRWLockExclusive(&g_reaction_lock);
     memcpy(g_reaction_samples,samples,size_t(n)*sizeof(samples[0]));g_reaction_n=n;
+    memcpy(g_reaction2,samples2,size_t(n2)*sizeof(samples2[0]));g_reaction2_n=n2;
     ++g_reaction_seq;g_reaction_at=GetTickCount64();ReleaseSRWLockExclusive(&g_reaction_lock);
+}
+extern "C" __declspec(dllexport) int __cdecl swml_vehicle_push_samples2(VehiclePushSample2* out,int max,uint32_t* seq) {
+    if(!out || max<0 || !seq)return 0;
+    AcquireSRWLockShared(&g_reaction_lock);*seq=g_reaction_seq;
+    int n=GetTickCount64()-g_reaction_at<100?std::min(max,g_reaction2_n):0;
+    memcpy(out,g_reaction2,size_t(n)*sizeof(out[0]));ReleaseSRWLockShared(&g_reaction_lock);return n;
 }
 extern "C" __declspec(dllexport) int __cdecl swml_vehicle_push_samples(SwmlVehiclePushSample* out,int max,uint32_t* seq) {
     if(!out || max<0 || !seq)return 0;

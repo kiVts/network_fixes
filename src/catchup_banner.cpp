@@ -1,9 +1,13 @@
 
 #include "game.h"
-#include "gl_text.h"
 #include "hooks.h"
 #include "log.h"
 #include "sdk.h"
+#if __has_include("status_line.h")
+#include "status_line.h"
+#else
+static bool status_line(const char*, uint32_t = 0) { return false; } // an SDK without the status line: nothing is shown
+#endif
 
 #include <windows.h>
 #include <algorithm>
@@ -16,6 +20,7 @@ constexpr uintptr_t kCatchUp = 0x1408686c0;
 constexpr uint32_t kQueueCount = 0xce300;
 constexpr uint32_t kHideTicks = 14;
 constexpr ULONGLONG kStaleMs = 2000;
+constexpr uint32_t kRed = 0xff1a1ff2; // AABBGGRR, as status_line.h's SWML_STATUS_RED
 
 using U = uint64_t;
 using CatchUp_t = void(__fastcall*)(U, U, U, U, U);
@@ -25,7 +30,7 @@ uint32_t g_show_ticks = 30;
 std::atomic<uint32_t> g_queued{0};
 std::atomic<ULONGLONG> g_at{0};
 bool g_shown = false; // render thread
-bool g_failed_logged = false;
+bool g_old_core_logged = false;
 
 void __fastcall catchup_detour(U g, U a2, U a3, U a4, U a5)
 {
@@ -34,25 +39,18 @@ void __fastcall catchup_detour(U g, U a2, U a3, U a4, U a5)
     g_at.store(GetTickCount64(), std::memory_order_relaxed);
 }
 
-void on_present(void* hdc, void*)
+void on_present(void*, void*)
 {
     ULONGLONG at = g_at.load(std::memory_order_relaxed);
     uint32_t q = g_queued.load(std::memory_order_relaxed);
     bool fresh = at && GetTickCount64() - at < kStaleMs;
     bool show = fresh && (g_shown ? q > kHideTicks : q > g_show_ticks);
-    if (show != g_shown) {
-        g_shown = show;
-        swlog("catch-up banner: %s (%u ticks queued)", show ? "shown" : "hidden", q);
-    }
-    if (!show) return;
-    HDC dc = static_cast<HDC>(hdc);
-    RECT rc{};
-    HWND wnd = WindowFromDC(dc);
-    int h = wnd && GetClientRect(wnd, &rc) ? rc.bottom - rc.top : 1080;
-    int size = std::clamp(h / 24, 18, 96);
-    if (!gltext::draw_top(dc, "CATCHING UP...", size, std::max(8, h / 40), {0.95f, 0.12f, 0.10f, 1.0f}) && !g_failed_logged) {
-        g_failed_logged = true;
-        swlog("catch-up banner: couldn't draw (see \"text overlay:\")");
+    if (show == g_shown) return;
+    g_shown = show;
+    swlog("catch-up banner: %s (%u ticks queued)", show ? "shown" : "hidden", q);
+    if (!status_line(show ? "CATCHING UP..." : nullptr, kRed) && !g_old_core_logged) {
+        g_old_core_logged = true;
+        swlog("catch-up banner: not shown, this SWML is too old for the status line (4.7.11 or newer)");
     }
 }
 
