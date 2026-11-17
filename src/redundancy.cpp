@@ -44,11 +44,6 @@ constexpr uint32_t kMaxPacket = 1100; // stay inside one UDP packet
 constexpr int kCopies = 3;            // each message rides in this many consecutive packets
 constexpr int kMaxHellos = 5;
 constexpr DWORD kEpochIdleMs = 3000;
-// At most one copy packet per this many ms per peer. A client sends a channel-0 message every frame, and on the
-// loading screen that is ~1300 fps: 2026-10-22 02:53:59 a joining client sent 3230 copy packets (347 KB, 5x the
-// originals) in 5 s, a 10 s queue at its upload rate. Skipping a packet is the same as losing one: the messages it
-// would have carried come in the next packet (each rides in kCopies) or from the reliable stream. Host tick updates
-// (16-22 ms apart) are never skipped.
 constexpr double kMinCopyGapMs = 8;
 constexpr size_t kIdentitySize = 136;
 // SteamNetworkingMessage_t
@@ -313,13 +308,6 @@ void reset_receive(Peer& p, uint32_t epoch)
     memset(p.rel_hash, 0, sizeof(p.rel_hash));
 }
 
-// One vote for "S = r + offset". Synced once an offset has kVotesNeeded votes and 3x the runner-up.
-// Only unambiguous matches vote: a hash that matches more than one message in the window says nothing about the
-// offset. 2026-10-22 03:41, host receiving a joining client's copies: on the loading screen the client sends nearly
-// identical channel-0 messages every frame, every copy matched hundreds of reliable messages, the votes spread over
-// hundreds of offsets (never 3:1), the vote map grew without bound while each vote scanned all of it, and the game's
-// network thread (which runs this) ended up spending its time here: it stopped sending to the client (no world, the
-// client stuck on the Spawning screen) and never noticed it leave. The map is also capped now.
 bool vote(Peer& p, int64_t offset)
 {
     while (!p.delivered.empty() && p.delivered.begin()->first < p.r) {

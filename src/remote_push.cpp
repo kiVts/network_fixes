@@ -22,7 +22,7 @@ constexpr int kBodies[] = {0x478, 0x480, 0x488};
 constexpr double kTickRate = 62.5; // 16 ms ticks
 constexpr double kTeleportM = 2.0; // per tick = 120 m/s
 constexpr double kMaxSpeed = 15.0;
-constexpr int kSpan = 5;          // ticks the velocity is measured over (the client's transform interval)
+constexpr int kSpan = 5;
 constexpr DWORD kForgetMs = 10000;
 constexpr uintptr_t kIsHost = 0x140ceb6ff; // byte: 1 host / single player, 0 client
 

@@ -189,7 +189,7 @@ bool aim_trace_install()
     if (!GetPrivateProfileIntW(L"capture",L"enabled",0,settings_ini()) && !GetPrivateProfileIntW(L"aim_trace",L"enabled",0,settings_ini())) return false;
     // Deliberately limited to actual-PE-verified layouts. Future builds fail closed
     // even if a generic function signature happens to continue matching.
-    if (game_build()!=0x6a9a9e20 && game_build()!=0x6ae31989) {
+    if (game_build()!=0x6a9a9e20 && game_build()!=0x6ae31989 && game_build()!=0x6afb81d6) {
         swlog("aim trace: unavailable (build %x has no verified field contract)",game_build()); return false;
     }
     g_camera=native_find_vtable("c_scene_vehicle_component_camera");

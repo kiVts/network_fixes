@@ -69,11 +69,6 @@ int g_fixed_rate_kb = 0; // only used with rate_control=0
 double g_start_rate = 256 * 1024.0, g_min_rate = 32 * 1024.0, g_max_rate = 8192 * 1024.0;
 int g_pace_ms = 40; // 0 = no tick priority
 int g_nagle_us = 0; // -1 = Steam default (5000)
-// Largest UDP payload Steam sends (0 = Steam's 1300). 2026-10-31 21:20: a direct route over Tailscale (MTU 1280, IPv6)
-// passed 1232-byte payloads and lost every bigger one (IPv6 isn't fragmented on the way, and the fragments the sender
-// makes didn't get through): Steam's 1300-byte data packets all vanished while its small pings / acks arrived, so
-// the connection looked alive and the world download delivered 0 KB/s until the join timed out. 1200 fits any path
-// that carries IPv6's minimum 1280 (1232 + 48 bytes of headers), relay or direct.
 int g_mtu = 1200;
 bool g_direct = false;  // allow ICE (direct UDP) for every peer, not only Steam friends / the Steam client's default
 int g_sdr_penalty = 10; // ms added to the relay's ping when Steam picks a route: direct wins unless it's > 10 ms worse
@@ -95,7 +90,7 @@ SetGlobalInt32_t g_set_int = nullptr;
 // SteamNetworkingIdentity is 136 bytes; compared on type + size + SteamID or IPv6/port (first 32 bytes), never logged.
 constexpr size_t kIdentitySize = 136;
 constexpr int kMaxPeers = 16;
-constexpr int kTicksPerWindow = 5; // 200 ms ticks -> 1 s measurement windows
+constexpr int kTicksPerWindow = 5;
 constexpr int kBwWindows = 6;      // max filter over the last 6 busy windows
 
 struct Peer {
@@ -107,7 +102,7 @@ struct Peer {
     // controller-thread state
     bool live = false, have_last = false;
     int64_t last_outstanding = 0;
-    int64_t last_queued = 0, last_unacked = 0; // for the rate measurement (in-flight allowance applied to both)
+    int64_t last_queued = 0, last_unacked = 0;
     double win_delivered = 0, win_dt = 0;
     double win_busy_delivered = 0, win_busy_dt = 0;
     int win_ticks = 0, win_busy_ticks = 0;
@@ -440,7 +435,7 @@ constexpr int kCruisePhases = sizeof(kCruiseGain) / sizeof(kCruiseGain[0]);
 Mode g_mode = Mode::startup;
 int g_phase = 0;
 double g_rate = 0;        // last applied
-double g_window_rate = 0; // in force during the window being measured
+double g_window_rate = 0;
 int g_idle_windows = 0;
 double g_session_start = 0; // the start rate (start_rate()), restored after a player leaves / a long idle
 bool g_peer_left = false;   // a connected peer's session ended since the last idle window
@@ -612,10 +607,6 @@ void tick(double dt)
         // answering, and so did its acks. Unknown (no clock, nothing received yet) counts as answering.
         if (g_now_usec && ch0_last && (g_now_usec(g_utils) - ch0_last) / 1000 > kGapMs) p.win_stalled = true;
         p.st = st;
-        // Unreliable sends count too: `added` includes them and they share the wire. Counting only the reliable
-        // queue made a client whose upload was mostly unreliable measure ~7 KB/s "delivered" out of 32 KB/s on the
-        // wire with no loss, and the cruise rate (gain x that) sat at the 32 KB/s floor for the whole session
-        // (friend's Proton log 2026-10-22 02:37: 590 KB reliable + 1.9 MB unreliable queued, Steam said 78 s).
         int64_t queued = static_cast<int64_t>(st.pending_reliable) + st.pending_unreliable;
         int64_t outstanding = queued + st.sent_unacked_reliable;
         if (p.have_last) {
@@ -824,10 +815,6 @@ void steam_output(int type, const char* msg)
     swlog("steam: [%d] %s", type, msg ? msg : "");
 }
 
-// The thread below calls into Steam every 200 ms and never ends on its own. At exit the game shuts Steam down while
-// it may be mid-call: friend's Proton session 2026-10-22 02:17:34, access violation reading 0xbeef in
-// lsteamclient.dll called from this thread. SteamAPI_Shutdown (hooked) now stops it first: it waits for the
-// thread's current round (each round holds g_round) and the thread leaves before touching Steam again.
 SRWLOCK g_round = SRWLOCK_INIT;
 volatile LONG g_stopped = 0;
 using Shutdown_t = void (*)();
@@ -887,15 +874,10 @@ DWORD WINAPI net_thread(void*)
     log_config(get_cfg, "Steam defaults");
     if (g_send_buffer_kb > 0) g_set_int(g_utils, kCfgSendBufferSize, g_send_buffer_kb * 1024);
     if (g_recv_buffer_kb > 0) g_set_int(g_utils, kCfgRecvBufferSize, g_recv_buffer_kb * 1024);
-    // Nagle only delays the game's event messages (channels 1..7; tick updates are sent with NoNagle):
-    // up to 5 ms each by default.
     if (g_nagle_us >= 0) g_set_int(g_utils, kCfgNagleTime, g_nagle_us);
     if (g_mtu > 0)
         swlog("net: Steam packets at most %d bytes (MTU_PacketSize; fits IPv6 / Tailscale paths) %s", g_mtu,
               g_set_int(g_utils, kCfgMtuPacketSize, g_mtu) ? "set" : "FAILED to set");
-    // Direct path: Steam's P2P connections go through its relays (SDR) unless both ends allow ICE. Measured
-    // 2026-10-22: 41 ms ping to a server on the same PC = relayed. Both players need this (or Steam's "allow direct
-    // connections" set) for a direct route; a vanilla peer keeps the relay. Connections made after this use it.
     if (g_direct) {
         bool ok = g_set_int(g_utils, kCfgIceEnable, kIceEnableAll) && g_set_int(g_utils, kCfgIcePenalty, 0) &&
                   g_set_int(g_utils, kCfgSdrPenalty, g_sdr_penalty);
@@ -903,8 +885,6 @@ DWORD WINAPI net_thread(void*)
               ok ? "on" : "FAILED to set", g_sdr_penalty);
         using SetStr_t = bool(__cdecl*)(void*, int, const char*);
         auto set_str = reinterpret_cast<SetStr_t>(GetProcAddress(api, "SteamAPI_ISteamNetworkingUtils_SetGlobalConfigValueString"));
-        // 2026-10-24: Steam's STUN server (103.10.125.24:3478) never answered from a peer's network, so it found no public
-        // address and NAT traversal failed (5009), though UDP hole punching works there (Tailscale goes direct).
         if (g_stun[0] && set_str)
             swlog("net: STUN servers %s: %s", set_str(g_utils, kCfgStunList, g_stun) ? "set" : "FAILED to set", g_stun);
         using DbgFn = void (*)(int, const char*);

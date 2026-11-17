@@ -361,7 +361,7 @@ bool logic_trace_install()
     g_capture=GetPrivateProfileIntW(L"capture",L"enabled",0,settings_ini())!=0;
     if(!g_capture && !GetPrivateProfileIntW(L"logic_trace",L"enabled",0,settings_ini()))return false;
     g_capture_vehicle=GetPrivateProfileIntW(L"capture",L"vehicle_id",0,settings_ini());
-    if((game_build()!=0x6a9a9e20 && game_build()!=0x6ae31989) || !resolve(kResolveScope)) {
+    if((game_build()!=0x6a9a9e20 && game_build()!=0x6ae31989 && game_build()!=0x6afb81d6) || !resolve(kResolveScope)) {
         swlog("logic trace: unavailable (unverified game layout or SDK slot discovery failed)");return false;
     }
     g_slots=addrs().off_scope_slots;

@@ -40,7 +40,6 @@ public:
     }
     void observed(double elapsed_ms, uint32_t before, uint32_t after, int cap, double budget_ms) {
         overran_ = false;
-        // Real-time ticks cost less than 16 ms each by construction; only time beyond them counts against the budget.
         budget_ms += (owed_ - 1) * tick_period_ms;
         if (!std::isfinite(elapsed_ms) || elapsed_ms < 0) { tick_ms_ = 0; cooldown_ = 8; previous_ = 1; overran_ = true; return; }
         // Empty clock polls and arrivals hiding progress are not measurements of a physics tick.

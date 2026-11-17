@@ -1,15 +1,3 @@
-// Version check: both ends tell each other which swml mods they run, and the log says what differs.
-//
-// A client replays the host's world with its own copy of the simulation, so a mod that changes the simulation on one
-// end only makes the two drift apart (2026-10-24: the friend ran realistic_aero 0.5.6 with the VLM off against the
-// host's 0.5.7 lattice, and nothing said so). The manifest is a line of "id=version" for every enabled mod plus the
-// few settings that change the simulation itself (physics_fixes' wheel spin, realistic_aero's fixes and VLM mode,
-// network_fixes' remote push), read from the mods folder and swml.ini at start-up. It travels once per peer and
-// session on our channel 11, reliably, after the redundancy hello (redundancy.cpp); peers without this mod never see it.
-//
-// Logs "versions: peerN ..." once per peer and manifest: "same mods" or every difference, marked
-//   MUST MATCH  mods every player needs (multiplayer=everyone, e.g. scope_look's game data)
-//   differs     anything else: informational (a client replays the host's physics, it doesn't recompute it).
 
 #include "log.h"
 #include "net_shared.h"

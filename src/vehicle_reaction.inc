@@ -1,10 +1,21 @@
-// Last solved substep gives the steady contact force I/dt against replay-driven vehicle bodies.
-// Transfer the reciprocal horizontal force to the host, where the large vehicle remains simulated.
+constexpr double kReactionMaxN=1500,kGravity=9.81,kFallbackCharacterKg=80;
 SRWLOCK g_reaction_lock=SRWLOCK_INIT;
 SwmlVehiclePushSample g_reaction_samples[16]{};
 int g_reaction_n=0;
 uint32_t g_reaction_seq=0;
 ULONGLONG g_reaction_at=0;
+double g_reaction_mass_logged=-1;
+double character_push_cap(const uint8_t* const mine[3])
+{
+    double kg=0;
+    for(int j=0;j<3;j++)if(mine[j]){double im=rd<double>(mine[j],0x3d0);if(std::isfinite(im) && im>0)kg+=1/im;}
+    if(!(kg>1) || kg>1000)kg=kFallbackCharacterKg;
+    if(std::fabs(kg-g_reaction_mass_logged)>.5) {
+        g_reaction_mass_logged=kg;
+        swlog("large vehicle push: your character weighs %.1f kg, so it pushes vehicles with at most %.0f N",kg,std::min(kReactionMaxN,kg*kGravity));
+    }
+    return std::min(kReactionMaxN,kg*kGravity);
+}
 void sample_vehicle_reaction(const uint8_t* world,double dt,SwmlVehiclePushSample out[16],int& count)
 {
     count=0;
@@ -61,5 +72,6 @@ void sample_vehicle_reaction(const uint8_t* world,double dt,SwmlVehiclePushSampl
         total+=mag;++n;
     }
     count=n;
-    if(total>1500)for(int j=0;j<count;j++)for(float& f:out[j].force)f=float(f*1500/total);
+    double cap=n?character_push_cap(mine):kReactionMaxN;
+    if(total>cap)for(int j=0;j<count;j++)for(float& f:out[j].force)f=float(f*cap/total);
 }

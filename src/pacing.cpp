@@ -63,8 +63,6 @@ double ms_since(int64_t t0)
 void step(DWORD now)
 {
     if (g_is_host && *g_is_host == 0) {
-        // A client: the host sets the pace. A period left from hosting before goes at once (2026-10-31: joining
-        // right after hosting, the client waited 6.6-7.5 ms per tick for 8 s of its catch-up with 18 ms left over).
         g_period = kGameTickMs;
         return;
     }

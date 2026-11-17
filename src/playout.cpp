@@ -18,7 +18,11 @@ constexpr uintptr_t kCatchUp = 0x1408686c0, kClientSend = 0x14023e590, kClockMs 
 constexpr uint32_t kLastTick = 0xce490, kQueueCount = 0xce300, kServerStep = 0xce3b0;
 constexpr uint32_t kBacklogTicks = 14; // above this the game's own fast catch-up plays
 constexpr double kGameTickMs = 16.0;   // a host that isn't lagging makes one tick per 16 ms
-constexpr double kStalePaceTicks = 4;  // this far above the target, the measured period is ignored for the game's own
+constexpr double kStalePaceTicks = 4;
+constexpr double kShortFreezeMs = 150; // a freeze this short is one a slightly deeper queue would have covered
+constexpr double kFloorRaiseMs = 5000; // two short freezes within this raise the floor by one tick
+constexpr double kFloorHoldMs = 30000; // the floor drops one tick after this long without a short freeze
+constexpr int64_t kStallGapUs = 250000; // a gap this long is the host stalling, not jitter: the window starts after it
 
 using U = uint64_t;
 using CatchUp_t = void(__fastcall*)(U, U, U, U, U);
@@ -31,7 +35,7 @@ Clock_t g_clock = nullptr;
 int g_mode = 1; // 0 observe, 1 while redundant copies arrive, 2 always
 bool g_on = false;
 int g_min_ticks = 1;
-double g_max_ms = 20;
+double g_max_ms = 50;
 
 // --- arrivals (network thread -> update thread) --------------------------------------------
 constexpr size_t kWindow = 600;
@@ -51,6 +55,15 @@ double g_target = 4;     // ticks
 double g_jitter_ms = 0, g_period_ms = 16.67;
 LONGLONG g_target_lowered = 0;
 uint64_t g_seen_total = 0;
+// Freeze feedback: the floor under the target, raised by repeated short freezes.
+int g_floor = 0;              // extra ticks over min_ticks
+LONGLONG g_freeze_start = 0;  // the queue ran dry with a tick due here (0 = playing)
+LONGLONG g_last_short = 0;    // the last short freeze ended here (the floor's hold)
+LONGLONG g_pending_short = 0; // a short freeze waiting for a second one (0 = none)
+LONGLONG g_floor_changed = 0;
+uint64_t g_short_freezes = 0; // for the log window
+uint64_t g_stall_gaps = 0;    // host stalls seen in the arrival window (for the log)
+int64_t g_last_stall_at = 0;  // receive time of the arrival after the last stall counted
 
 // stats for the 10 s log line
 LONGLONG g_win_start = 0;
@@ -77,14 +90,19 @@ void update_jitter()
         for (size_t i = 0; i < n; i++) a.push_back(g_arrivals[(g_arr_next + i) % n]); // oldest first
     }
     if (a.size() < 60) return;
-    // A gap of > 2 s (menu, loading, reconnect) starts a new measurement.
     size_t first = 0;
     for (size_t i = 1; i < a.size(); i++) {
-        if (a[i] - a[i - 1] > 2000000) first = i;
+        if (a[i] - a[i - 1] > kStallGapUs) {
+            first = i;
+            if (a[i] > g_last_stall_at) {
+                g_last_stall_at = a[i];
+                g_stall_gaps++;
+            }
+        }
     }
     size_t n = a.size() - first;
     if (n < 60) return;
-    double period = double(a.back() - a[first]) / double(n - 1); // us per message
+    double period = double(a.back() - a[first]) / double(n - 1);
     if (period <= 0) return;
     std::vector<double> late(n);
     double base = 1e300;
@@ -101,8 +119,14 @@ void update_jitter()
 void update_target(LONGLONG now)
 {
     double tick_ms = std::clamp(g_period_ms, 8.0, 100.0);
-    double want = std::ceil(g_jitter_ms / tick_ms) + 1;
-    want = std::clamp(want, double(g_min_ticks), std::max(double(g_min_ticks), std::floor(g_max_ms / tick_ms)));
+    double cap = std::max(double(g_min_ticks), std::floor(g_max_ms / tick_ms));
+    // Freeze feedback: the floor comes down a tick after kFloorHoldMs without a short freeze.
+    if (g_floor > 0 && qpc_ms(g_floor_changed, now) > kFloorHoldMs && qpc_ms(g_last_short, now) > kFloorHoldMs) {
+        g_floor--;
+        g_floor_changed = now;
+    }
+    double want = std::max(std::ceil(g_jitter_ms / tick_ms) + 1, double(g_min_ticks + g_floor));
+    want = std::clamp(want, double(g_min_ticks), cap);
     if (want >= g_target) {
         g_target = want;
         g_target_lowered = now;
@@ -142,13 +166,15 @@ void log_window(LONGLONG now)
     if (span < 10000) return;
     if (g_calls > 0) {
         swlog("playout 10s (%s): target %.0f ticks (jitter p80 %.1f ms, server tick %.1f ms)  depth avg %.1f min %u max %u  "
-              "frozen %llu times / %.0f ms  speed %.2f..%.2f  game catch-up %llu calls",
+              "frozen %llu times / %.0f ms (%llu short)  speed %.2f..%.2f  game catch-up %llu calls  floor +%d  host stalls %llu",
               g_on ? "on" : "observe only", g_target, g_jitter_ms, g_period_ms, g_depth_sum / double(g_calls),
               g_depth_min == UINT32_MAX ? 0 : g_depth_min, g_depth_max, static_cast<unsigned long long>(g_starved),
-              g_starved_ms, g_rate_min > 8 ? 1.0 : g_rate_min, g_rate_max < 0.01 ? 1.0 : g_rate_max,
-              static_cast<unsigned long long>(g_vanilla));
+              g_starved_ms, static_cast<unsigned long long>(g_short_freezes), g_rate_min > 8 ? 1.0 : g_rate_min,
+              g_rate_max < 0.01 ? 1.0 : g_rate_max, static_cast<unsigned long long>(g_vanilla), g_floor,
+              static_cast<unsigned long long>(g_stall_gaps));
     }
     g_win_start = now;
+    g_short_freezes = g_stall_gaps = 0;
     g_calls = g_starved = g_vanilla = 0;
     g_starved_ms = g_depth_sum = 0;
     g_rate_min = 9;
@@ -198,10 +224,28 @@ void decide()
         if (g_credit + dt / tick_ms >= 1) {
             g_starved++;
             g_starved_ms += dt;
+            if (!g_freeze_start) g_freeze_start = now;
         }
         g_credit = 0;
         log_window(now);
         return; // the game resets its own clock here
+    }
+    if (g_freeze_start) {
+        // A freeze just ended. A short one is a tick that came a little late: two of them close together raise the
+        // floor a tick (a long one is the host stalling, which no buffer covers).
+        if (qpc_ms(g_freeze_start, now) < kShortFreezeMs) {
+            g_short_freezes++;
+            int cap_floor = std::max(0, int(std::floor(g_max_ms / tick_ms)) - g_min_ticks);
+            if (g_pending_short && qpc_ms(g_pending_short, now) < kFloorRaiseMs && g_floor < cap_floor) {
+                g_floor++;
+                g_floor_changed = now;
+                g_pending_short = 0; // the next raise needs two new freezes
+            } else {
+                g_pending_short = now;
+            }
+            g_last_short = now;
+        }
+        g_freeze_start = 0;
     }
     if (n > kBacklogTicks) {
         g_vanilla++;
@@ -212,8 +256,6 @@ void decide()
     double rate = std::clamp(1.0 + 0.06 * (g_depth_s - g_target), 0.8, 1.5);
     g_rate_min = std::min(g_rate_min, rate);
     g_rate_max = std::max(g_rate_max, rate);
-    // A queue above the target says the host is faster than the period measured so far (it just stopped lagging), and it
-    // says so sooner than the arrivals' window can. At kStalePaceTicks above, any period drains the queue.
     double stale = std::clamp((g_depth_s - g_target) / kStalePaceTicks, 0.0, 1.0);
     double pace_ms = tick_ms + (std::min(tick_ms, kGameTickMs) - tick_ms) * stale;
     g_credit = std::min(g_credit + dt / pace_ms * rate, 10.0);
@@ -252,14 +294,23 @@ bool install()
     if (mode < 0) return true;
     g_mode = std::min(mode, 2);
     g_min_ticks = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"net", L"playout_min_ticks", 1, ini)), 1, 8);
-    g_max_ms = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"net", L"playout_max_ms", 20, ini)), 16, 1000);
+    int max_ms = static_cast<int>(GetPrivateProfileIntW(L"net", L"playout_max_ms", 50, ini));
+    // 20 was the default from 1.6.1 to 1.11.12 and every settings.ini written then has it: a 1 tick cap that freezes
+    // the world on every slightly late update. Read as the new default; any other value is the player's own choice.
+    bool old_default = max_ms == 20;
+    if (old_default) max_ms = 50;
+    g_max_ms = std::clamp(max_ms, 16, 1000);
     QueryPerformanceFrequency(&g_freq);
     g_arrivals.reserve(kWindow);
     g_clock = game_ptr<Clock_t>(kClockMs);
     bool ok = hook_game(kCatchUp, reinterpret_cast<void*>(&catchup_detour), reinterpret_cast<void**>(&g_orig_catchup)) &&
               hook_game(kClientSend, reinterpret_cast<void*>(&client_send_detour), reinterpret_cast<void**>(&g_orig_send));
     static const char* kModes[] = {"observe only", "on while redundant copies arrive", "always on"};
-    swlog("playout: %s (min %d ticks, max %.0f ms)", ok ? kModes[g_mode] : "FAILED", g_min_ticks, g_max_ms);
+    swlog("playout: %s (min %d ticks, max %.0f ms%s; repeated short freezes raise the buffer a tick, one tick back after "
+          "%.0f s without)",
+          ok ? kModes[g_mode] : "FAILED", g_min_ticks, g_max_ms,
+          old_default ? ", settings.ini's playout_max_ms=20 is the old default and is read as 50 (21 keeps 1 tick)" : "",
+          kFloorHoldMs / 1000.0);
     return ok;
 }
 

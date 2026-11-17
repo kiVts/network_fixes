@@ -2,6 +2,7 @@
 #include "game.h"
 #include "hooks.h"
 #include "log.h"
+#include "resolve.h"
 #include "editor_background.h"
 #include "editor_budget.h"
 #include "host_map_scheduler.h"
@@ -21,7 +22,7 @@ double host_map_pacing_period_ms();
 namespace {
 
 constexpr uintptr_t kTick = 0x1408483e0;                       // (game state, ?, ?, ?): one update loop iteration
-constexpr uintptr_t kMainLoop = 0x140848ae0, kMainLoopSize = 2936;
+constexpr uintptr_t kMainLoop = 0x140848ae0;
 constexpr uintptr_t kIsHost = 0x140ceb6ff;                     // byte: 1 host / single player, 0 client
 constexpr uintptr_t kCatchUp = 0x1408686c0;
 constexpr uint32_t kQueueCount = 0xce300;
@@ -346,9 +347,11 @@ bool install()
     g_host_map_budget_ms = std::clamp(int(GetPrivateProfileIntW(L"net", L"host_map_budget_ms", host_map::default_budget_ms, settings_ini())), 0, 50);
     QueryPerformanceFrequency(&g_freq);
     g_main_lo = reinterpret_cast<uintptr_t>(game_ptr<void*>(kMainLoop));
-    g_main_hi = g_main_lo + per_build<uintptr_t>(kMainLoopSize, 2984); // build 0x6ae218ec: the loop grew 48 bytes
+    // The loop's end from the game's unwind data (its length changes with updates), not a per-build constant.
+    uintptr_t main_begin = 0;
+    if (!g_main_lo || !native_function_bounds(g_main_lo, &main_begin, &g_main_hi) || main_begin != g_main_lo) return false;
     g_is_host = game_ptr<const volatile uint8_t*>(kIsHost);
-    if (!g_is_host || !g_main_lo) return false;
+    if (!g_is_host) return false;
     bool limited = !g_editor_ticks;
     bool ok = hook_game(kTick, reinterpret_cast<void*>(&tick_detour), reinterpret_cast<void**>(&g_orig));
     if (ok && g_host_map_budget_ms) {

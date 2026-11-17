@@ -14,7 +14,7 @@ uint32_t g_force_out_seq=0,g_force_sent_seq=0;
 struct PeerForces {uint32_t seq=0;DWORD at=0;std::vector<WireVehicleForce> forces;};
 std::map<int,PeerForces> g_peer_forces;
 uint64_t g_force_samples=0,g_force_packets=0,g_force_applied=0,g_force_rejected=0;
-double g_force_max_n=0;
+double g_force_max_n=0,g_force_sum_n=0,g_force_max_lever=0,g_force_min_kg=0,g_force_max_accel=0;
 
 void collect_vehicle_forces(const RingView& vehicles)
 {
@@ -40,7 +40,9 @@ void collect_vehicle_forces(const RingView& vehicles)
                 if(body!=samples[j].body)continue;
                 WireVehicleForce f{};f.id=id;f.body=uint16_t(k);
                 memcpy(f.point,samples[j].point,sizeof f.point);memcpy(f.force,samples[j].force,sizeof f.force);
-                g_force_out.push_back(f);++g_force_samples;found=true;break;
+                g_force_out.push_back(f);++g_force_samples;found=true;
+                g_force_max_n=std::max(g_force_max_n,std::sqrt(double(f.force[0])*f.force[0]+double(f.force[1])*f.force[1]+double(f.force[2])*f.force[2]));
+                break;
             }
         }
     }
@@ -75,8 +77,13 @@ void apply_vehicle_forces(uint8_t* scene,const RingView& vehicles,const double r
             Box bounds;bool inside=body_box(body,bounds);
             for(int a=0;a<3 && inside;a++)inside=point[a]>=bounds.mn[a]-.5 && point[a]<=bounds.mx[a]+.5;
             if(!contact_near || !inside){++g_force_rejected;continue;}
+            g_force_max_lever=std::max(g_force_max_lever,std::fabs(offset[1]));offset[1]=0;
             float F[3],P[3];for(int a=0;a<3;a++){F[a]=float(force[a]);P[a]=float(offset[a]);}
-            g_add_force(scene,so,F,P,1);++g_force_applied;g_force_max_n=std::max(g_force_max_n,length3(force));
+            g_add_force(scene,so,F,P,1);++g_force_applied;
+            double n=length3(force),kg=1/ *reinterpret_cast<const double*>(body+kBodyInvMass);
+            g_force_max_n=std::max(g_force_max_n,n);g_force_sum_n+=n;
+            if(!(g_force_min_kg>0) || kg<g_force_min_kg)g_force_min_kg=kg;
+            g_force_max_accel=std::max(g_force_max_accel,n/kg);
         }
         ++it;
     }

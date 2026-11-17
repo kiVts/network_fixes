@@ -29,9 +29,10 @@ constexpr uintptr_t kSetLinearVelocity = 0x1401a72d0; // (scene, scene object, c
 constexpr uintptr_t kSetAngularVelocity = 0x1401a73a0; // (scene, scene object, const float[3]); wakes the body
 constexpr uintptr_t kIsHost = 0x140ceb6ff;
 
-size_t world_scene() { return per_build<size_t>(0x64c8, 0x64d0); }
-size_t world_ring() { return per_build<size_t>(0x6390, 0x6398); }
-size_t world_vehicles() { return per_build<size_t>(0x4ca8, 0x4cb0); }
+size_t g_world_scene = 0, g_world_ring = 0, g_world_vehicles = 0;
+size_t world_scene() { return g_world_scene; }
+size_t world_ring() { return g_world_ring; }
+size_t world_vehicles() { return g_world_vehicles; }
 constexpr size_t kEntryHandle = 0x90, kEntryId = 0x98;
 struct KindDef {
     size_t slot, scene_object;
@@ -944,6 +945,13 @@ void client_tick(uint8_t* world)
         double fx = (me[low].mn[0] + me[low].mx[0]) / 2, fz = (me[low].mn[2] + me[low].mx[2]) / 2;
         return me[low].mn[1] >= b.mx[1] - kStandM && fx >= b.mn[0] && fx <= b.mx[0] && fz >= b.mn[2] && fz <= b.mx[2];
     };
+    auto aboard_vehicle = [&](const Box& b) {
+        if (!nme) return false;
+        double fx = (me[low].mn[0] + me[low].mx[0]) / 2, fz = (me[low].mn[2] + me[low].mx[2]) / 2;
+        // A chassis box includes its roof and empty interior. A lower deck, or a jump above it,
+        // must retain host physics too; only a character outside the footprint is a side pusher.
+        return me[low].mn[1] >= b.mn[1] - kStandM && fx >= b.mn[0] && fx <= b.mx[0] && fz >= b.mn[2] && fz <= b.mx[2];
+    };
 
     if (nme) {
         for (uint32_t i = 0; i < objects.count; i++) {
@@ -984,7 +992,8 @@ void client_tick(uint8_t* world)
                 ok = p.body && body_box(p.body, b) && box_ok(b, 1e6);
                 if (!ok) break;
                 grow(all, b, j == 0);
-                if (touching(b)) touch = true, standing = standing || stands_on(b);
+                if (touching(b)) touch = true;
+                standing = standing || aboard_vehicle(b);
                 u.parts.push_back(p);
             }
             if (!ok) continue;
@@ -1040,6 +1049,18 @@ void client_tick(uint8_t* world)
             it = g_units.erase(it);
             g_released++;
             continue;
+        }
+        if (u.vehicle && !u.releasing_since && (u.parts[0].saved_body_flags & kFlagDriven)) {
+            bool aboard = false;
+            for (const Part& p : u.parts) {
+                Box b;
+                if (!body_box(p.body, b)) continue;
+                aboard = aboard || (p.kind < kJointPart ? aboard_vehicle(b) : touching(b) && stands_on(b));
+            }
+            if (aboard) {
+                u.releasing_since = now;
+                restore_all(scene, u);
+            }
         }
         if (!u.support_logged && now - u.since >= 100) {
             const Part& p = u.parts[0];
@@ -1271,7 +1292,12 @@ void maybe_log_stats()
         swlog("large vehicle push 30s (%s): %llu contact samples, %llu force packets, %llu host force applications, %llu rejected; largest force %.1f N",
               host?"host":"client",(unsigned long long)g_force_samples,(unsigned long long)g_force_packets,
               (unsigned long long)g_force_applied,(unsigned long long)g_force_rejected,g_force_max_n);
+    if(g_force_applied)
+        swlog("large vehicle push 30s (host): average applied %.1f N, lightest pushed body %.0f kg, largest push %.2f m/s2, "
+              "contact up to %.2f m above/below the centre of mass (applied at its height)",
+              g_force_sum_n/double(g_force_applied),g_force_min_kg,g_force_max_accel,g_force_max_lever);
     g_force_samples=g_force_packets=g_force_applied=g_force_rejected=0;g_force_max_n=0;
+    g_force_sum_n=g_force_max_lever=g_force_min_kg=g_force_max_accel=0;
     memset(g_refused, 0, sizeof g_refused);
     g_taken = g_taken_vehicles = g_released = g_denies_got = g_lost = g_dropped_kin = g_batches = g_no_joints = 0;
     g_h_claims = g_h_steer = g_h_denied = g_h_done = g_h_batches = g_watch_lines = 0;
@@ -1346,6 +1372,10 @@ bool install()
         swlog("object push: off in settings.ini");
         return true;
     }
+    g_world_scene = game_field("world", 0x64c8);
+    g_world_ring = game_field("world", 0x6390);
+    g_world_vehicles = game_field("world", 0x4ca8);
+    if (!g_world_scene || !g_world_ring || !g_world_vehicles) return false;
     g_is_host = game_ptr<const volatile uint8_t*>(kIsHost);
     g_set_flags = game_ptr<SetFlags_t>(kSetCollisionFlags);
     g_set_masks = game_ptr<SetMasks_t>(kSetCollisionMasks);
